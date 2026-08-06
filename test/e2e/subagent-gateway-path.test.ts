@@ -243,6 +243,66 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     });
   });
 
+  it('governed worker honors an operator-approved zero-cost Ollama model', async () => {
+    const model = 'ollama:gemma4:e2b';
+    await engine.setConfig('chat_model', model);
+    await engine.executeRaw(
+      `INSERT INTO oauth_clients
+         (client_id, client_name, client_secret_hash, scope, grant_types, redirect_uris,
+          token_endpoint_auth_method, budget_usd_per_day)
+       VALUES ('gbrain_cl_local', 'local', '', 'agent', ARRAY['client_credentials'],
+               ARRAY[]::text[], 'client_secret_post', 0.05)`,
+    );
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return {
+        text: 'local result',
+        blocks: [{ type: 'text', text: 'local result' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 12, output_tokens: 3, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model,
+        providerId: 'ollama',
+      } satisfies ChatResult;
+    });
+
+    const handler = buildHandler(makeStubTools([]));
+    const { jobId, ctx } = await makeFakeJob({ prompt: 'hello', model });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET owner_client_id = 'gbrain_cl_local', requested_job_budget_cents = 1,
+              correlation_id = 'handler-local-budget-test'
+        WHERE id = $1`,
+      [jobId],
+    );
+
+    expect((await handler(ctx)).result).toBe('local result');
+    expect(calls).toBe(1);
+    const reservations = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT status, estimated_cents::text, actual_cents::text, pricing_source
+         FROM mcp_spend_reservations WHERE job_id = $1`,
+      [jobId],
+    );
+    expect(reservations).toEqual([{
+      status: 'settled',
+      estimated_cents: '0.0000',
+      actual_cents: '0.0000',
+      pricing_source: 'built-in',
+    }]);
+
+    await engine.setConfig('chat_model', 'anthropic:claude-sonnet-4-6');
+    const unapproved = await makeFakeJob({ prompt: 'blocked', model });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET owner_client_id = 'gbrain_cl_local', requested_job_budget_cents = 1,
+              correlation_id = 'handler-local-budget-refusal'
+        WHERE id = $1`,
+      [unapproved.jobId],
+    );
+    await expect(handler(unapproved.ctx)).rejects.toThrow(/pricing unavailable/);
+    expect(calls).toBe(1);
+  });
+
   it('happy path 2-turn with tool: dispatches, persists v2 stable ID, returns final text', async () => {
     let turn = 0;
     __setChatTransportForTests(async () => {

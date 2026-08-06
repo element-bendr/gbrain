@@ -60,6 +60,7 @@ import type {
   GatewaySpendContext,
 } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
+import { isModelExplicitlyConfigured, resolveRecipe } from '../../ai/model-resolver.ts';
 import { randomUUIDv7 } from 'bun';
 
 // ── Defaults ────────────────────────────────────────────────
@@ -259,7 +260,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // route ALL subagent jobs through gateway.toolLoop() (works for every
     // provider in src/core/ai/recipes/). When OFF, route through the legacy
     // Anthropic-direct path AND refuse non-Anthropic models loudly.
-    const governedSpendContext = await loadGovernedGatewaySpendContext(engine, ctx.id);
+    const governedSpendContext = await loadGovernedGatewaySpendContext(engine, ctx.id, model, config);
     const useGatewayLoopRaw = await engine.getConfig('agent.use_gateway_loop').catch(() => null);
     // #2753: share the doctor's truthiness set. Before this, the doctor accepted
     // yes/on but the worker did not, so `config set ... yes` reported healthy
@@ -849,6 +850,8 @@ interface GatewayRunArgs {
 async function loadGovernedGatewaySpendContext(
   engine: BrainEngine,
   jobId: number,
+  model: string,
+  config: GBrainConfig,
 ): Promise<GatewaySpendContext | null> {
   const rows = await engine.executeRaw<Record<string, unknown>>(
     `SELECT j.owner_client_id, j.requested_job_budget_cents, j.correlation_id,
@@ -871,6 +874,13 @@ async function loadGovernedGatewaySpendContext(
       (jobCapCents !== undefined && (!Number.isSafeInteger(jobCapCents) || jobCapCents < 0))) {
     throw new Error(`governed job ${jobId} has invalid budget metadata; provider call refused`);
   }
+  const dbChatModel = config.chat_model === undefined
+    ? await engine.getConfig('chat_model').catch(() => null)
+    : null;
+  const configuredModels = [config.chat_model ?? dbChatModel, ...(config.chat_fallback_chain ?? [])];
+  const providerId = (() => {
+    try { return resolveRecipe(model).parsed.providerId; } catch { return null; }
+  })();
   return {
     engine,
     clientId: ownerClientId,
@@ -880,6 +890,7 @@ async function loadGovernedGatewaySpendContext(
     correlationId: typeof rows[0]?.correlation_id === 'string'
       ? rows[0].correlation_id
       : `job:${jobId}`,
+    allowZeroPrice: providerId === 'ollama' && isModelExplicitlyConfigured(model, configuredModels),
   };
 }
 

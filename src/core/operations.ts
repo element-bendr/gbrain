@@ -3448,7 +3448,7 @@ const submit_agent: Operation = {
     if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/.test(requestedModel)) {
       throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
     }
-    const { resolveRecipe, assertTouchpoint } = await import('./ai/model-resolver.ts');
+    const { resolveRecipe, assertTouchpoint, isModelExplicitlyConfigured } = await import('./ai/model-resolver.ts');
     let recipe: import('./ai/types.ts').Recipe;
     let parsed: import('./ai/types.ts').ParsedModelId;
     try {
@@ -3483,14 +3483,7 @@ const submit_agent: Operation = {
       : null;
     const configuredModels = [ctx.config.chat_model ?? dbChatModel, ...(ctx.config.chat_fallback_chain ?? [])]
       .filter((model): model is string => typeof model === 'string');
-    const explicitlyConfigured = configuredModels.some(model => {
-      try {
-        const configured = resolveRecipe(model).parsed;
-        return `${configured.providerId}:${configured.modelId}` === effectiveModel;
-      } catch {
-        return false;
-      }
-    });
+    const explicitlyConfigured = isModelExplicitlyConfigured(effectiveModel, configuredModels);
     if (!(chat.models ?? []).includes(parsed.modelId) && !explicitlyConfigured) {
       throw new OperationError(
         'unknown_model',

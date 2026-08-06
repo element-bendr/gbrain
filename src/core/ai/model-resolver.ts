@@ -77,6 +77,28 @@ export function resolveRecipe(modelId: string): { parsed: ParsedModelId; recipe:
   return { parsed, recipe };
 }
 
+/** Match configured model IDs after provider normalization and alias resolution. */
+export function isModelExplicitlyConfigured(
+  modelId: string,
+  configuredModels: ReadonlyArray<string | null | undefined>,
+): boolean {
+  let target: ParsedModelId;
+  try {
+    target = resolveRecipe(modelId).parsed;
+  } catch {
+    return false;
+  }
+  return configuredModels.some(candidate => {
+    if (typeof candidate !== 'string') return false;
+    try {
+      const configured = resolveRecipe(candidate).parsed;
+      return configured.providerId === target.providerId && configured.modelId === target.modelId;
+    } catch {
+      return false;
+    }
+  });
+}
+
 type KnownTouchpointKey = 'embedding' | 'expansion' | 'chat' | 'reranker';
 
 function getTouchpoint(recipe: Recipe, touchpoint: TouchpointKind): EmbeddingTouchpoint | ExpansionTouchpoint | ChatTouchpoint | RerankerTouchpoint | undefined {
