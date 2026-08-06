@@ -1054,6 +1054,51 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(res.status).toBe(401);
   });
 
+  test('agent OAuth cannot use operator-only client registration', async () => {
+    const { execSync } = await import('child_process');
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    let agentId: string | undefined;
+    try {
+      await sql`INSERT INTO pages(source_id, slug, type, title)
+        VALUES ('default', 'e2e-agent/root', 'note', 'E2E agent root') ON CONFLICT DO NOTHING`;
+      const registration = execSync(
+        'bun run src/cli.ts auth register-client e2e-agent-no-admin ' +
+          '--grant-types client_credentials --scopes agent ' +
+          '--bound-tools search --bound-source default --bound-slug-prefixes e2e-agent/ ' +
+          '--bound-max-concurrent 1 --budget-usd-per-day 1.00 ' +
+          '--control-capabilities submit_agent --allowed-providers anthropic ' +
+          '--allowed-models anthropic:claude-sonnet-4-6',
+        { cwd: process.cwd(), encoding: 'utf8', env: { ...process.env } },
+      );
+      agentId = registration.match(/Client ID:\s+(gbrain_cl_\S+)/)?.[1];
+      const agentSecret = registration.match(/Client Secret:\s+(gbrain_cs_\S+)/)?.[1];
+      expect(agentId).toBeTruthy();
+      expect(agentSecret).toBeTruthy();
+      const token = await fetch(`${BASE}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=client_credentials&client_id=${agentId}&client_secret=${agentSecret}&scope=agent`,
+      });
+      expect(token.ok).toBe(true);
+      const { access_token } = await token.json() as { access_token: string };
+      const response = await fetch(`${BASE}/admin/api/register-client`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'forged-admin-registration' }),
+      });
+      expect(response.status).toBe(401);
+    } finally {
+      if (agentId) {
+        execSync(`bun run src/cli.ts auth revoke-client "${agentId}"`, {
+          cwd: process.cwd(), encoding: 'utf8', env: { ...process.env },
+        });
+      }
+      await sql`DELETE FROM pages WHERE source_id = 'default' AND slug = 'e2e-agent/root'`;
+      await sql.end();
+    }
+  }, 15_000);
+
   // =========================================================================
   // F7 + F7b: HTTP MCP shell-job RCE regression
   // =========================================================================

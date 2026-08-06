@@ -264,6 +264,43 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
     });
   });
 
+  describe('trace metadata is bounded and never authority', () => {
+    it('rejects oversized trace ids before queue insertion', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(callSubmitAgent(ctx, { prompt: 'go', correlation_id: 'x'.repeat(65) })).rejects.toThrow(
+        /Trace IDs must be 1-64 characters/,
+      );
+      expect((await engine.executeRaw(`SELECT id FROM minion_jobs`)).length).toBe(0);
+    });
+
+    it('derives owner from OAuth even when caller supplies forged owner metadata', async () => {
+      await seedClient('alice', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const result = await callSubmitAgent(makeCtx({ clientId: 'alice' }), {
+        prompt: 'go',
+        owner_client_id: 'gbrain_cl_bob',
+        __owner_client_id: 'gbrain_cl_bob',
+        correlation_id: 'forged-authority',
+      });
+      const [job] = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT owner_client_id, correlation_id, data FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      const data = typeof job.data === 'string' ? JSON.parse(job.data) : job.data as Record<string, unknown>;
+      expect(job.owner_client_id).toBe('gbrain_cl_alice');
+      expect(data.__owner_client_id).toBe('gbrain_cl_alice');
+      expect(job.correlation_id).toBe('forged-authority');
+    });
+  });
+
   describe('durable budget policy', () => {
     it('refuses governed submission when the registered daily budget is unset', async () => {
       await seedClient('cursor', {

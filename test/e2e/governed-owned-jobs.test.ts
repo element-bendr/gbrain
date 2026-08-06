@@ -52,7 +52,9 @@ describePG('governed owner-scoped job control on PostgreSQL', () => {
     const bob = ctx('gbrain_cl_bob');
     expect((await op('get_owned_job').handler(alice, { id }) as any).id).toBe(id);
     for (const name of ['get_owned_job', 'cancel_owned_job', 'message_owned_job', 'get_owned_job_events']) {
-      const params = name === 'message_owned_job' ? { id, payload: { text: 'forged' } } : { id };
+      const params = name === 'message_owned_job'
+        ? { id, owner_client_id: 'gbrain_cl_alice', correlation_id: 'forged-authority', payload: { text: 'forged' } }
+        : { id, owner_client_id: 'gbrain_cl_alice', correlation_id: 'forged-authority' };
       await expect(op(name).handler(bob, params)).rejects.toThrow(/Owned job unavailable/);
     }
     expect(await op('list_owned_jobs').handler(bob, {})).toEqual([]);
@@ -71,6 +73,9 @@ describePG('governed owner-scoped job control on PostgreSQL', () => {
     expect(events.limit).toBe(100);
     expect(events.events.map((event: any) => event.event_type)).toEqual(['cancelled']);
     await expect(op('message_owned_job').handler(alice, { id, payload: { text: 'late' } })).rejects.toThrow(/terminal/);
+    const completedId = await seed('gbrain_cl_alice', 'completed');
+    await expect(op('message_owned_job').handler(alice, { id: completedId, payload: { text: 'late' } })).rejects.toThrow(/terminal/);
+    await expect(op('get_owned_job_events').handler(alice, { id, cursor: -1 })).rejects.toThrow(/cursor.*non-negative/i);
 
     const admin = { ...alice, auth: { ...alice.auth!, scopes: ['admin'] } } as OperationContext;
     expect((await op('get_job').handler(admin, { id }) as any).id).toBe(id);
