@@ -58,7 +58,10 @@ function normalizeModel(value: string): string {
   }
   const { parsed, recipe } = resolveRecipe(value);
   assertTouchpoint(recipe, 'chat', parsed.modelId);
-  return `${parsed.providerId}:${value.slice(value.indexOf(':') + 1)}`;
+  if (!(recipe.touchpoints.chat?.models ?? []).includes(parsed.modelId)) {
+    throw new Error(`unknown static chat model: ${parsed.providerId}:${parsed.modelId}`);
+  }
+  return `${parsed.providerId}:${parsed.modelId}`;
 }
 
 export async function validateAgentClientBindings(

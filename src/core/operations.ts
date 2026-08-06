@@ -3381,7 +3381,7 @@ const submit_agent: Operation = {
   description: 'Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. Requires the `agent` OAuth scope. Tools, source, slug prefixes, max concurrency, and daily budget are bound at OAuth client registration time.',
   params: {
     prompt: { type: 'string', required: true, description: 'User prompt for the agent' },
-    model: { type: 'string', description: 'provider:model string (defaults to models.tier.subagent)' },
+    model: { type: 'string', required: true, description: 'Explicit provider:model string' },
     allowed_tools: { type: 'array', description: 'Subset of bound_tools the agent may invoke', items: { type: 'string' } },
     allowed_slug_prefixes: { type: 'array', description: 'Subset of bound_slug_prefixes for put_page writes', items: { type: 'string' } },
     max_turns: { type: 'number', description: 'Max LLM turns (default 20, hard cap 100)' },
@@ -3412,7 +3412,8 @@ const submit_agent: Operation = {
     try {
       bindingRows = await sql`
         SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
-               bound_max_concurrent, budget_usd_per_day::text AS budget_cap
+               bound_max_concurrent, budget_usd_per_day::text AS budget_cap,
+               allowed_providers, allowed_models
           FROM oauth_clients
          WHERE client_id = ${clientId}
       `;
@@ -3431,12 +3432,88 @@ const submit_agent: Operation = {
     const boundSlugPrefixes = (binding.bound_slug_prefixes as string[] | null) ?? null;
     const boundMaxConcurrent = Number(binding.bound_max_concurrent ?? 1);
     const budgetCapText = (binding.budget_cap as string | null) ?? null;
+    const allowedProviders = (binding.allowed_providers as string[] | null) ?? [];
+    const allowedModels = (binding.allowed_models as string[] | null) ?? [];
 
     if (boundTools === null) {
       throw new OperationError(
         'permission_denied',
         `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
       );
+    }
+
+    // Governed callers choose one exact provider:model. Resolve aliases once,
+    // persist the requested/effective pair, and never consult a fallback chain.
+    const requestedModel = typeof p.model === 'string' ? p.model : '';
+    if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(requestedModel)) {
+      throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
+    }
+    const { resolveRecipe, assertTouchpoint } = await import('./ai/model-resolver.ts');
+    let recipe: import('./ai/types.ts').Recipe;
+    let parsed: import('./ai/types.ts').ParsedModelId;
+    try {
+      ({ recipe, parsed } = resolveRecipe(requestedModel));
+    } catch (error) {
+      throw new OperationError(
+        'unknown_provider',
+        `submit_agent refused provider for "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try {
+      assertTouchpoint(recipe, 'chat', parsed.modelId);
+    } catch (error) {
+      throw new OperationError(
+        'unknown_model',
+        `submit_agent refused model "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const effectiveModel = `${parsed.providerId}:${parsed.modelId}`;
+    if (!allowedProviders.includes(parsed.providerId)) {
+      throw new OperationError('provider_not_allowed', `Provider "${parsed.providerId}" is not allowed for this OAuth client.`);
+    }
+    if (!allowedModels.includes(effectiveModel)) {
+      throw new OperationError('model_not_allowed', `Model "${effectiveModel}" is not allowed for this OAuth client.`);
+    }
+    const chat = recipe.touchpoints.chat;
+    if (!chat?.supports_tools) {
+      throw new OperationError('model_not_tool_capable', `Model "${effectiveModel}" cannot run the agent tool loop.`);
+    }
+    const configuredModels = [ctx.config.chat_model, ...(ctx.config.chat_fallback_chain ?? [])]
+      .filter((model): model is string => typeof model === 'string');
+    const explicitlyConfigured = configuredModels.some(model => {
+      try {
+        const configured = resolveRecipe(model).parsed;
+        return `${configured.providerId}:${configured.modelId}` === effectiveModel;
+      } catch {
+        return false;
+      }
+    });
+    if (!(chat.models ?? []).includes(parsed.modelId) && !explicitlyConfigured) {
+      throw new OperationError(
+        'unknown_model',
+        `Model "${effectiveModel}" is not in the provider's static chat catalog or explicit operator configuration.`,
+      );
+    }
+    const enabledProvidersRaw = await ctx.engine.getConfig('agent.enabled_providers').catch(() => null);
+    if (enabledProvidersRaw !== null) {
+      const enabledProviders = enabledProvidersRaw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+      if (!enabledProviders.includes(parsed.providerId)) {
+        throw new OperationError('provider_disabled', `Provider "${parsed.providerId}" is disabled by agent.enabled_providers.`);
+      }
+    }
+    const { buildGatewayConfig } = await import('./ai/build-gateway-config.ts');
+    const gatewayConfig = buildGatewayConfig(ctx.config);
+    const missingCredentials = (recipe.auth_env?.required ?? []).filter(name => !gatewayConfig.env[name]);
+    if (missingCredentials.length > 0) {
+      throw new OperationError(
+        'provider_credentials_missing',
+        `Provider "${parsed.providerId}" is missing required credential configuration: ${missingCredentials.join(', ')}.`,
+      );
+    }
+    const { quoteBudgetUsage } = await import('./budget/budget-tracker.ts');
+    const price = quoteBudgetUsage(effectiveModel, 1, 1, 'chat');
+    if (!price || (price.inputRateUsdPerMTok === 0 && price.outputRateUsdPerMTok === 0)) {
+      throw new OperationError('pricing_unavailable', `No approved non-zero pricing is configured for model "${effectiveModel}".`);
     }
 
     // Validate each param against the binding.
@@ -3548,6 +3625,8 @@ const submit_agent: Operation = {
         // is applied — a preview that hides this can't show a widening bug.
         resolved_tools: requestedTools,
         resolved_slug_prefixes: delegatedSlugPrefixes,
+        requested_model: requestedModel,
+        effective_model: effectiveModel,
       };
     }
 
@@ -3566,7 +3645,7 @@ const submit_agent: Operation = {
       correlation_id: correlationId,
       causation_id: causationId,
     };
-    if (typeof p.model === 'string') jobData.model = p.model;
+    jobData.model = effectiveModel;
     // Write source for the delegated job comes from the AUTHENTICATED client
     // whenever we have it. `bound_source_id` is an optional, separately-set
     // column: unset it defaulted the child to 'default', and if it disagreed
@@ -3583,7 +3662,7 @@ const submit_agent: Operation = {
     if (delegatedSource) jobData.source_id = delegatedSource;
     const requestFingerprint = createHash('sha256').update(JSON.stringify({
       prompt_sha256: createHash('sha256').update(String(p.prompt)).digest('hex'),
-      model: typeof p.model === 'string' ? p.model : null,
+      model: requestedModel,
       tools: requestedTools,
       slug_prefixes: delegatedSlugPrefixes,
       max_turns: jobData.max_turns,
@@ -3605,8 +3684,8 @@ const submit_agent: Operation = {
             requestFingerprint,
             correlationId,
             causationId,
-            requestedModel: typeof p.model === 'string' ? p.model : undefined,
-            effectiveModel: typeof p.model === 'string' ? p.model : undefined,
+            requestedModel,
+            effectiveModel,
             requestedJobBudgetCents,
           },
         },
@@ -3627,7 +3706,9 @@ const submit_agent: Operation = {
       logAgentSubmission({
         client_id: clientId,
         job_id: job.id,
-        model: typeof p.model === 'string' ? p.model : '<default>',
+        model: effectiveModel,
+        requested_model: requestedModel,
+        effective_model: effectiveModel,
         bound_tools: requestedTools,
         bound_source: boundSource,
         slug_prefixes: requestedSlugPrefixes,
@@ -3638,7 +3719,14 @@ const submit_agent: Operation = {
       });
     } catch { /* never block submission */ }
 
-    return { id: job.id, name: 'subagent', client_id: clientId, correlation_id: correlationId };
+    return {
+      id: job.id,
+      name: 'subagent',
+      client_id: clientId,
+      correlation_id: correlationId,
+      requested_model: requestedModel,
+      effective_model: effectiveModel,
+    };
   },
 };
 

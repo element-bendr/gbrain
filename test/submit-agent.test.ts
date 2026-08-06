@@ -29,6 +29,8 @@ if (!submit_agent) {
   throw new Error('submit_agent op missing from operations registry — test fixture invalid');
 }
 
+const TEST_MODEL = 'anthropic:claude-sonnet-4-6';
+
 let engine: PGLiteEngine;
 let tmpAuditDir: string;
 
@@ -60,6 +62,8 @@ interface SeedOpts {
   bound_max_concurrent?: number;
   budget_usd_per_day?: number | null;
   control_capabilities?: string[];
+  allowed_providers?: string[];
+  allowed_models?: string[];
   scope?: string;
 }
 
@@ -73,10 +77,11 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
        (client_id, client_name, client_secret_hash, scope, grant_types,
         redirect_uris, token_endpoint_auth_method,
         bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
-        bound_max_concurrent, budget_usd_per_day, control_capabilities, created_at, deleted_at)
+        bound_max_concurrent, budget_usd_per_day, control_capabilities,
+        allowed_providers, allowed_models, created_at, deleted_at)
      VALUES ($1, $1, '', $2, ARRAY['client_credentials'],
              ARRAY[]::text[], 'client_secret_post',
-             $3, $4, $5, $6, $7, $8, $9, now(), NULL)
+             $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), NULL)
      ON CONFLICT (client_id) DO UPDATE SET
        bound_tools = EXCLUDED.bound_tools,
        bound_source_id = EXCLUDED.bound_source_id,
@@ -84,6 +89,8 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
        bound_max_concurrent = EXCLUDED.bound_max_concurrent,
        budget_usd_per_day = EXCLUDED.budget_usd_per_day,
        control_capabilities = EXCLUDED.control_capabilities,
+       allowed_providers = EXCLUDED.allowed_providers,
+       allowed_models = EXCLUDED.allowed_models,
        scope = EXCLUDED.scope`,
     [
       authenticatedClientId,
@@ -95,14 +102,16 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
       opts.bound_max_concurrent ?? 1,
       opts.budget_usd_per_day === undefined ? 5.00 : opts.budget_usd_per_day,
       opts.control_capabilities ?? ['submit_agent'],
+      opts.allowed_providers ?? ['anthropic'],
+      opts.allowed_models ?? [TEST_MODEL],
     ],
   );
 }
 
-function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean } = {}): any {
+function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean; config?: Record<string, unknown> } = {}): any {
   return {
     engine,
-    config: {},
+    config: opts.config ?? { anthropic_api_key: 'test-key' },
     logger: console,
     dryRun: opts.dryRun ?? false,
     remote: opts.remote ?? true,
@@ -112,7 +121,7 @@ function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean }
 
 async function callSubmitAgent(ctx: any, params: Record<string, unknown>): Promise<any> {
   return await withEnv({ GBRAIN_AUDIT_DIR: tmpAuditDir }, async () => {
-    return await submit_agent.handler(ctx, params);
+    return await submit_agent.handler(ctx, { model: TEST_MODEL, ...params });
   });
 }
 
@@ -125,6 +134,94 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
     it('declares required prompt param', () => {
       expect(submit_agent.params.prompt).toBeDefined();
       expect((submit_agent.params.prompt as any).required).toBe(true);
+    });
+    it('declares required explicit model param', () => {
+      expect((submit_agent.params.model as any).required).toBe(true);
+    });
+  });
+
+  describe('provider and model policy', () => {
+    it('requires a qualified explicit model', async () => {
+      await seedClient('policy', { bound_tools: ['search'], bound_slug_prefixes: ['wiki/'] });
+      await expect(submit_agent.handler(makeCtx({ clientId: 'policy' }), { prompt: 'go' })).rejects.toMatchObject({
+        code: 'invalid_model',
+      });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy' }), { prompt: 'go', model: 'claude-sonnet-4-6' })).rejects.toMatchObject({
+        code: 'invalid_model',
+      });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy' }), { prompt: 'go', model: 'not-a-provider:model' })).rejects.toMatchObject({
+        code: 'unknown_provider',
+      });
+    });
+
+    it('enforces client provider and model allowlists', async () => {
+      await seedClient('policy', { bound_tools: ['search'], bound_slug_prefixes: ['wiki/'] });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy', config: { openai_api_key: 'test-key' } }), {
+        prompt: 'go', model: 'openai:gpt-4o-mini',
+      })).rejects.toMatchObject({ code: 'provider_not_allowed' });
+      await seedClient('policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['anthropic'], allowed_models: ['anthropic:claude-haiku-4-5-20251001'],
+      });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy' }), { prompt: 'go' })).rejects.toMatchObject({
+        code: 'model_not_allowed',
+      });
+    });
+
+    it('rejects disabled providers and missing credentials before queue insertion', async () => {
+      await seedClient('policy', { bound_tools: ['search'], bound_slug_prefixes: ['wiki/'] });
+      await engine.setConfig('agent.enabled_providers', 'openai');
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy' }), { prompt: 'go' })).rejects.toMatchObject({
+        code: 'provider_disabled',
+      });
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'agent.enabled_providers'`);
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy', config: {} }), { prompt: 'go' })).rejects.toMatchObject({
+        code: 'provider_credentials_missing',
+      });
+      const jobs = await engine.executeRaw<{ count: number }>(`SELECT COUNT(*)::int AS count FROM minion_jobs`);
+      expect(Number(jobs[0].count)).toBe(0);
+    });
+
+    it('rejects statically unknown and unpriced models before queue insertion', async () => {
+      await seedClient('policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_models: ['anthropic:claude-not-real'],
+      });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'policy' }), {
+        prompt: 'go', model: 'anthropic:claude-not-real',
+      })).rejects.toMatchObject({ code: 'unknown_model' });
+
+      await seedClient('policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['groq'], allowed_models: ['groq:llama-3.3-70b-versatile'],
+      });
+      await withEnv({ GROQ_API_KEY: 'test-key' }, async () => {
+        await expect(callSubmitAgent(makeCtx({ clientId: 'policy', config: {} }), {
+          prompt: 'go', model: 'groq:llama-3.3-70b-versatile',
+        })).rejects.toMatchObject({ code: 'pricing_unavailable' });
+      });
+      const jobs = await engine.executeRaw<{ count: number }>(`SELECT COUNT(*)::int AS count FROM minion_jobs`);
+      expect(Number(jobs[0].count)).toBe(0);
+    });
+
+    it('preserves requested id and records the canonical effective alias without fallback', async () => {
+      await seedClient('policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_models: ['anthropic:claude-haiku-4-5-20251001'],
+      });
+      const result = await callSubmitAgent(makeCtx({ clientId: 'policy' }), {
+        prompt: 'go', model: 'anthropic:claude-haiku-4-5',
+      });
+      expect(result.requested_model).toBe('anthropic:claude-haiku-4-5');
+      expect(result.effective_model).toBe('anthropic:claude-haiku-4-5-20251001');
+      const jobs = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT requested_model, effective_model, data FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      expect(jobs[0].requested_model).toBe('anthropic:claude-haiku-4-5');
+      expect(jobs[0].effective_model).toBe('anthropic:claude-haiku-4-5-20251001');
+      const data = typeof jobs[0].data === 'string' ? JSON.parse(jobs[0].data as string) : jobs[0].data;
+      expect((data as Record<string, unknown>).model).toBe('anthropic:claude-haiku-4-5-20251001');
     });
   });
 
@@ -416,6 +513,9 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(data.allowed_tools).toEqual(['search']);
       expect(data.__owner_client_id).toBe(oauthClientId('cursor'));
       expect(data.source_id).toBe('default'); // auto-set from bound_source_id
+      expect(data.model).toBe(TEST_MODEL);
+      expect(result.requested_model).toBe(TEST_MODEL);
+      expect(result.effective_model).toBe(TEST_MODEL);
 
       // Audit file written.
       const auditFiles = fs.readdirSync(tmpAuditDir).filter(f => f.startsWith('agent-jobs-'));
@@ -428,6 +528,8 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(auditLine.bound_source).toBe('default');
       expect(auditLine.budget_remaining_cents).toBe(500); // 5.00 USD → 500 cents
       expect(auditLine.outcome).toBe('submitted');
+      expect(auditLine.requested_model).toBe(TEST_MODEL);
+      expect(auditLine.effective_model).toBe(TEST_MODEL);
       // CRITICAL: prompt text MUST NOT be in audit (only byte count).
       expect(auditContent).not.toContain('YC W26 batch');
     });

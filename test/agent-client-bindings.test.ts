@@ -46,6 +46,7 @@ describe('governed agent client binding validation', () => {
 
   test('rejects malformed and cross-provider model allowlists', async () => {
     await expect(validate({ allowedModels: ['gpt-4o-mini'] })).rejects.toThrow('provider:model');
+    await expect(validate({ allowedModels: ['openai:not-a-real-model'] })).rejects.toThrow('not listed for OpenAI chat');
     await expect(validate({ allowedModels: ['anthropic:claude-sonnet-4-6'] })).rejects.toThrow('outside the provider allowlist');
   });
 });
