@@ -11,7 +11,7 @@
  */
 
 import express from 'express';
-import type { Socket } from 'net';
+import { isIP, type Socket } from 'net';
 import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
@@ -56,6 +56,33 @@ import { registerCleanup } from '../core/process-cleanup.ts';
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+export function nonLoopbackBindWarning(bind: string): string | null {
+  const host = bind.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  const loopback = host === 'localhost' || host === '::1' ||
+    (isIP(host) === 4 && host.split('.')[0] === '127');
+  if (loopback) return null;
+  return `[serve-http] SECURITY WARNING: --bind ${bind} exposes authenticated HTTP MCP beyond loopback. ` +
+    'Use a trusted TLS reverse proxy or tunnel before allowing remote clients.';
+}
+
+export function auditOAuthAuthenticationFailures(engine: BrainEngine) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const startedAt = Date.now();
+    res.once('finish', () => {
+      if (res.statusCode !== 401 || (req as Request & { auth?: AuthInfo }).auth) return;
+      void executeRawJsonb(
+        engine,
+        `INSERT INTO mcp_request_log
+           (token_name, agent_name, operation, latency_ms, status, error_message, params)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [null, null, 'mcp:authenticate', Math.max(0, Date.now() - startedAt), 'auth_failed', 'missing_or_invalid_oauth_bearer'],
+        [null],
+      ).catch(() => { /* authentication refusal must not depend on audit availability */ });
+    });
+    next();
+  };
+}
 
 /**
  * The narrowest contract this module actually consumes: subscribe, unsubscribe.
@@ -617,6 +644,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // than silently binding loopback only.
   const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
+
+  const bindWarning = nonLoopbackBindWarning(bind);
+  if (bindWarning) console.error(`\n${bindWarning}\n`);
 
   if (logFullParams) {
     console.error(
@@ -1874,7 +1904,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post(
+    '/mcp',
+    auditOAuthAuthenticationFailures(engine),
+    requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }),
+    async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -2158,7 +2192,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
       }
     }
-  });
+    },
+  );
 
   // ---------------------------------------------------------------------------
   // v0.38 ingestion substrate — POST /ingest (webhook source)

@@ -249,3 +249,21 @@ describe('whoami op metadata', () => {
     expect(whoami.mutating).toBeFalsy();
   });
 });
+
+describe('stdio control-plane boundary', () => {
+  test('auth-less stdio cannot call governed agent job operations', async () => {
+    const ctx = ctxWith({ remote: true, transport: 'stdio', auth: undefined });
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ['submit_agent', { prompt: 'nope', model: 'anthropic:claude-sonnet-4-6' }],
+      ['get_owned_job', { id: 1 }],
+      ['list_owned_jobs', {}],
+      ['cancel_owned_job', { id: 1 }],
+      ['message_owned_job', { id: 1, payload: { text: 'nope' } }],
+      ['get_owned_job_events', { id: 1 }],
+    ];
+    for (const [name, params] of calls) {
+      const operation = operations.find(candidate => candidate.name === name)!;
+      await expect(operation.handler(ctx, params)).rejects.toMatchObject({ code: 'permission_denied' });
+    }
+  });
+});

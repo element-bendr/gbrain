@@ -201,7 +201,10 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
   });
 
-  test('missing Authorization header returns 401', async () => {
+  test('missing Authorization header returns 401 and a secret-free audit row', async () => {
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    await sql`DELETE FROM mcp_request_log WHERE operation = 'mcp:authenticate'`;
     const res = await fetch(`${BASE}/mcp`, {
       method: 'POST',
       headers: {
@@ -211,6 +214,30 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     });
     expect(res.status).toBe(401);
+    try {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const rows = await sql`
+          SELECT token_name, agent_name, status, error_message, params
+            FROM mcp_request_log
+           WHERE operation = 'mcp:authenticate'
+           ORDER BY id DESC LIMIT 1
+        `;
+        if (rows.length) {
+          expect(rows[0]).toMatchObject({
+            token_name: null,
+            agent_name: null,
+            status: 'auth_failed',
+            error_message: 'missing_or_invalid_oauth_bearer',
+            params: null,
+          });
+          return;
+        }
+        await Bun.sleep(10);
+      }
+      throw new Error('authentication failure audit row was not persisted');
+    } finally {
+      await sql.end();
+    }
   });
 
   // =========================================================================
