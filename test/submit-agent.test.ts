@@ -204,6 +204,27 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(Number(jobs[0].count)).toBe(0);
     });
 
+    it('admits an explicitly configured zero-cost Ollama model only', async () => {
+      const model = 'ollama:gemma4:e2b';
+      await seedClient('local-policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['ollama'], allowed_models: [model],
+      });
+
+      await expect(callSubmitAgent(makeCtx({ clientId: 'local-policy', config: {} }), {
+        prompt: 'go', model,
+      })).rejects.toMatchObject({ code: 'pricing_unavailable' });
+
+      const result = await callSubmitAgent(makeCtx({
+        clientId: 'local-policy', config: { chat_model: model },
+      }), { prompt: 'go', model });
+      expect(result.requested_model).toBe(model);
+      expect(result.effective_model).toBe(model);
+
+      const jobs = await engine.executeRaw<{ count: number }>(`SELECT COUNT(*)::int AS count FROM minion_jobs`);
+      expect(Number(jobs[0].count)).toBe(1);
+    });
+
     it('preserves requested id and records the canonical effective alias without fallback', async () => {
       await seedClient('policy', {
         bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],

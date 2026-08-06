@@ -3445,7 +3445,7 @@ const submit_agent: Operation = {
     // Governed callers choose one exact provider:model. Resolve aliases once,
     // persist the requested/effective pair, and never consult a fallback chain.
     const requestedModel = typeof p.model === 'string' ? p.model : '';
-    if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(requestedModel)) {
+    if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/.test(requestedModel)) {
       throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
     }
     const { resolveRecipe, assertTouchpoint } = await import('./ai/model-resolver.ts');
@@ -3512,8 +3512,10 @@ const submit_agent: Operation = {
     }
     const { quoteBudgetUsage } = await import('./budget/budget-tracker.ts');
     const price = quoteBudgetUsage(effectiveModel, 1, 1, 'chat');
-    if (!price || (price.inputRateUsdPerMTok === 0 && price.outputRateUsdPerMTok === 0)) {
-      throw new OperationError('pricing_unavailable', `No approved non-zero pricing is configured for model "${effectiveModel}".`);
+    const zeroPriced = price?.inputRateUsdPerMTok === 0 && price.outputRateUsdPerMTok === 0;
+    const approvedLocalZeroPrice = parsed.providerId === 'ollama' && explicitlyConfigured;
+    if (!price || (zeroPriced && !approvedLocalZeroPrice)) {
+      throw new OperationError('pricing_unavailable', `No approved pricing is configured for model "${effectiveModel}".`);
     }
 
     // Validate each param against the binding.

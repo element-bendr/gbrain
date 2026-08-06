@@ -49,4 +49,16 @@ describe('governed agent client binding validation', () => {
     await expect(validate({ allowedModels: ['openai:not-a-real-model'] })).rejects.toThrow('not listed for OpenAI chat');
     await expect(validate({ allowedModels: ['anthropic:claude-sonnet-4-6'] })).rejects.toThrow('outside the provider allowlist');
   });
+
+  test('accepts only statically approved Ollama Gemma chat models', async () => {
+    const result = await validate({
+      allowedProviders: ['ollama'],
+      allowedModels: ['ollama:gemma4:e2b'],
+    });
+    expect(result.allowedModels).toEqual(['ollama:gemma4:e2b']);
+    await expect(validate({
+      allowedProviders: ['ollama'],
+      allowedModels: ['ollama:unknown-local-model'],
+    })).rejects.toThrow('unknown static chat model');
+  });
 });
