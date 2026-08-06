@@ -782,6 +782,33 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.budget_remaining_cents',
   'minion_jobs.budget_owner_job_id',
   'minion_jobs.budget_root_owner_id',
+  // v126-v129 — governed agent admission and gateway accounting. These
+  // columns and every index/constraint that references them are introduced
+  // together in the forward-only migration chain. mcp_spend_reservations is
+  // itself migration-owned (v83), while oauth_clients/minion_jobs readers run
+  // only after initSchema completes. The older schema blob never references
+  // these columns, so there is no bootstrap forward reference to satisfy.
+  'oauth_clients.control_capabilities',
+  'oauth_clients.allowed_providers',
+  'oauth_clients.allowed_models',
+  'minion_jobs.owner_client_id',
+  'minion_jobs.owner_idempotency_key',
+  'minion_jobs.request_fingerprint',
+  'minion_jobs.requested_model',
+  'minion_jobs.effective_model',
+  'minion_jobs.requested_job_budget_cents',
+  'minion_jobs.correlation_id',
+  'minion_jobs.causation_id',
+  'mcp_spend_reservations.attempt',
+  'mcp_spend_reservations.correlation_id',
+  'mcp_spend_reservations.estimated_input_tokens',
+  'mcp_spend_reservations.max_output_tokens',
+  'mcp_spend_reservations.actual_input_tokens',
+  'mcp_spend_reservations.actual_output_tokens',
+  'mcp_spend_reservations.actual_cache_read_tokens',
+  'mcp_spend_reservations.actual_cache_creation_tokens',
+  'mcp_spend_reservations.pricing_source',
+  'mcp_spend_reservations.pricing_version',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

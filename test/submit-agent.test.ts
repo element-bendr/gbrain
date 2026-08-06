@@ -59,35 +59,42 @@ interface SeedOpts {
   bound_slug_prefixes?: string[] | null;
   bound_max_concurrent?: number;
   budget_usd_per_day?: number | null;
+  control_capabilities?: string[];
   scope?: string;
 }
 
+const oauthClientId = (clientId: string): string =>
+  clientId.startsWith('gbrain_cl_') ? clientId : `gbrain_cl_${clientId}`;
+
 async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> {
+  const authenticatedClientId = oauthClientId(clientId);
   await engine.executeRaw(
     `INSERT INTO oauth_clients
        (client_id, client_name, client_secret_hash, scope, grant_types,
         redirect_uris, token_endpoint_auth_method,
         bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
-        bound_max_concurrent, budget_usd_per_day, created_at, deleted_at)
+        bound_max_concurrent, budget_usd_per_day, control_capabilities, created_at, deleted_at)
      VALUES ($1, $1, '', $2, ARRAY['client_credentials'],
              ARRAY[]::text[], 'client_secret_post',
-             $3, $4, $5, $6, $7, $8, now(), NULL)
+             $3, $4, $5, $6, $7, $8, $9, now(), NULL)
      ON CONFLICT (client_id) DO UPDATE SET
        bound_tools = EXCLUDED.bound_tools,
        bound_source_id = EXCLUDED.bound_source_id,
        bound_slug_prefixes = EXCLUDED.bound_slug_prefixes,
        bound_max_concurrent = EXCLUDED.bound_max_concurrent,
        budget_usd_per_day = EXCLUDED.budget_usd_per_day,
+       control_capabilities = EXCLUDED.control_capabilities,
        scope = EXCLUDED.scope`,
     [
-      clientId,
+      authenticatedClientId,
       opts.scope ?? 'read agent',
       opts.bound_tools ?? null,
       opts.bound_source_id ?? null,
       opts.bound_brain_id ?? null,
       opts.bound_slug_prefixes ?? null,
       opts.bound_max_concurrent ?? 1,
-      opts.budget_usd_per_day ?? null,
+      opts.budget_usd_per_day === undefined ? 5.00 : opts.budget_usd_per_day,
+      opts.control_capabilities ?? ['submit_agent'],
     ],
   );
 }
@@ -99,7 +106,7 @@ function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean }
     logger: console,
     dryRun: opts.dryRun ?? false,
     remote: opts.remote ?? true,
-    auth: opts.clientId ? { clientId: opts.clientId } : undefined,
+    auth: opts.clientId ? { clientId: oauthClientId(opts.clientId) } : undefined,
   };
 }
 
@@ -141,7 +148,36 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
     it('refuses when client_id is unknown', async () => {
       const ctx = makeCtx({ clientId: 'nobody-here' });
       await expect(callSubmitAgent(ctx, { prompt: 'hi' })).rejects.toThrow(
-        /client_id nobody-here not found/,
+        /OAuth client is not bound to submit_agent/,
+      );
+    });
+  });
+
+  describe('owner-scoped idempotency input', () => {
+    it('rejects an empty idempotency key', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(callSubmitAgent(ctx, { prompt: 'go', idempotency_key: '' })).rejects.toThrow(
+        /idempotency_key must be 1-128 characters/,
+      );
+    });
+  });
+
+  describe('durable budget policy', () => {
+    it('refuses governed submission when the registered daily budget is unset', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+        budget_usd_per_day: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(callSubmitAgent(ctx, { prompt: 'go' })).rejects.toThrow(
+        /requires a registered daily budget/i,
       );
     });
   });
@@ -184,7 +220,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       const ctx = makeCtx({ clientId: 'cursor' });
       await expect(
         callSubmitAgent(ctx, { prompt: 'go', allowed_tools: ['put_page'] }),
-      ).rejects.toThrow(/tool "put_page" is not in client cursor's bound_tools/);
+      ).rejects.toThrow(/tool "put_page" is not in client gbrain_cl_cursor's bound_tools/);
     });
 
     it('defaults to bound_tools when allowed_tools omitted', async () => {
@@ -273,14 +309,14 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       // Seed 2 already-running subagent jobs for this client.
       for (let i = 0; i < 2; i++) {
         await engine.executeRaw(
-          `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-           VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())`,
-          [JSON.stringify({ prompt: `existing-${i}`, __owner_client_id: 'cursor' })],
+          `INSERT INTO minion_jobs (name, status, data, owner_client_id, queue, priority, created_at)
+           VALUES ('subagent', 'active', $1::jsonb, $2, 'default', 0, now())`,
+          [JSON.stringify({ prompt: `existing-${i}`, __owner_client_id: oauthClientId('cursor') }), oauthClientId('cursor')],
         );
       }
       const ctx = makeCtx({ clientId: 'cursor' });
       await expect(callSubmitAgent(ctx, { prompt: 'one too many' })).rejects.toThrow(
-        /at concurrency cap \(2\/2\)/,
+        /Agent concurrency limit reached \(2\/2\)/,
       );
     });
 
@@ -292,9 +328,9 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_max_concurrent: 3,
       });
       await engine.executeRaw(
-        `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-         VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())`,
-        [JSON.stringify({ prompt: 'one', __owner_client_id: 'cursor' })],
+        `INSERT INTO minion_jobs (name, status, data, owner_client_id, queue, priority, created_at)
+         VALUES ('subagent', 'active', $1::jsonb, $2, 'default', 0, now())`,
+        [JSON.stringify({ prompt: 'one', __owner_client_id: oauthClientId('cursor') }), oauthClientId('cursor')],
       );
       const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
       const result = await callSubmitAgent(ctx, { prompt: 'two' });
@@ -312,9 +348,9 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       // 5 completed jobs — none counted (status filter is waiting/active/waiting-children).
       for (let i = 0; i < 5; i++) {
         await engine.executeRaw(
-          `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-           VALUES ('subagent', 'completed', $1::jsonb, 'default', 0, now())`,
-          [JSON.stringify({ prompt: `done-${i}`, __owner_client_id: 'cursor' })],
+          `INSERT INTO minion_jobs (name, status, data, owner_client_id, queue, priority, created_at)
+           VALUES ('subagent', 'completed', $1::jsonb, $2, 'default', 0, now())`,
+          [JSON.stringify({ prompt: `done-${i}`, __owner_client_id: oauthClientId('cursor') }), oauthClientId('cursor')],
         );
       }
       const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
@@ -337,9 +373,9 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       });
       // Alice has 1 active — at her cap.
       await engine.executeRaw(
-        `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-         VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())`,
-        [JSON.stringify({ prompt: 'alice-busy', __owner_client_id: 'alice' })],
+        `INSERT INTO minion_jobs (name, status, data, owner_client_id, queue, priority, created_at)
+         VALUES ('subagent', 'active', $1::jsonb, $2, 'default', 0, now())`,
+        [JSON.stringify({ prompt: 'alice-busy', __owner_client_id: oauthClientId('alice') }), oauthClientId('alice')],
       );
       // Bob's submit should succeed — his cap (1) is independent.
       const ctxBob = makeCtx({ clientId: 'bob', dryRun: true });
@@ -364,7 +400,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       });
       expect(result.id).toBeGreaterThan(0);
       expect(result.name).toBe('subagent');
-      expect(result.client_id).toBe('cursor');
+      expect(result.client_id).toBe(oauthClientId('cursor'));
 
       // Job persisted with correct shape.
       const rows = await engine.executeRaw<Record<string, unknown>>(
@@ -378,7 +414,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         : (rows[0].data as Record<string, unknown>);
       expect(data.prompt).toBe('research the YC W26 batch');
       expect(data.allowed_tools).toEqual(['search']);
-      expect(data.__owner_client_id).toBe('cursor');
+      expect(data.__owner_client_id).toBe(oauthClientId('cursor'));
       expect(data.source_id).toBe('default'); // auto-set from bound_source_id
 
       // Audit file written.
@@ -386,7 +422,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(auditFiles.length).toBe(1);
       const auditContent = fs.readFileSync(path.join(tmpAuditDir, auditFiles[0]), 'utf8');
       const auditLine = JSON.parse(auditContent.trim().split('\n')[0]);
-      expect(auditLine.client_id).toBe('cursor');
+      expect(auditLine.client_id).toBe(oauthClientId('cursor'));
       expect(auditLine.job_id).toBe(result.id);
       expect(auditLine.bound_tools).toEqual(['search']);
       expect(auditLine.bound_source).toBe('default');

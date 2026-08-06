@@ -267,6 +267,32 @@ function costForUsage(modelId: string, inputTokens: number, outputTokens: number
   return (inputTokens / 1_000_000) * p.input + (outputTokens / 1_000_000) * p.output;
 }
 
+export interface BudgetPriceQuote {
+  costUsd: number;
+  inputRateUsdPerMTok: number;
+  outputRateUsdPerMTok: number;
+  source: 'built-in';
+  version: 'gbrain-model-pricing-v1';
+}
+
+/** Deterministic, fail-closed pricing view used by durable governed-job accounting. */
+export function quoteBudgetUsage(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+  kind: BudgetKind = 'chat',
+): BudgetPriceQuote | null {
+  const pricing = lookupPricing(modelId, kind);
+  if (!pricing) return null;
+  return {
+    costUsd: (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output,
+    inputRateUsdPerMTok: pricing.input,
+    outputRateUsdPerMTok: pricing.output,
+    source: 'built-in',
+    version: 'gbrain-model-pricing-v1',
+  };
+}
+
 export class BudgetTracker {
   private cumulativeUsd = 0;
   private callsRecorded = 0;
@@ -538,6 +564,23 @@ export function extractUsageFromError(
     }
   }
   return { inputTokens: fallback.inputTokens, outputTokens: fallback.outputTokens };
+}
+
+/** Returns only provider-reported usage; no pessimistic fallback or guessed charge. */
+export function extractReportedUsageFromError(
+  err: unknown,
+): { inputTokens: number; outputTokens: number } | null {
+  if (!err || typeof err !== 'object') return null;
+  const top = (err as { usage?: unknown }).usage;
+  const nested = (err as { response?: { usage?: unknown } }).response?.usage;
+  const candidate = (top && typeof top === 'object' ? top : nested && typeof nested === 'object' ? nested : null) as
+    | { input_tokens?: number; output_tokens?: number; inputTokens?: number; outputTokens?: number }
+    | null;
+  if (!candidate) return null;
+  const inputTokens = numericOrNull(candidate.input_tokens ?? candidate.inputTokens);
+  const outputTokens = numericOrNull(candidate.output_tokens ?? candidate.outputTokens);
+  if (inputTokens === null && outputTokens === null) return null;
+  return { inputTokens: inputTokens ?? 0, outputTokens: outputTokens ?? 0 };
 }
 
 function numericOrNull(v: unknown): number | null {

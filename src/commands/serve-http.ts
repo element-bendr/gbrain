@@ -1684,16 +1684,38 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
         return;
       }
-      const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
-      );
-      // Set per-client TTL if specified
-      if (tokenTtl && Number(tokenTtl) > 0) {
-        await sql`UPDATE oauth_clients SET token_ttl = ${Number(tokenTtl)} WHERE client_id = ${result.clientId}`;
+      const body = req.body as Record<string, unknown>;
+      const asStrings = (camel: string, snake: string): string[] | undefined => {
+        const value = body[camel] ?? body[snake];
+        return Array.isArray(value) ? value.map(String) : undefined;
+      };
+      const agentBindings = {
+        controlCapabilities: asStrings('controlCapabilities', 'control_capabilities') ?? [],
+        boundTools: asStrings('boundTools', 'bound_tools'),
+        boundSourceId: String(body.boundSourceId ?? body.bound_source_id ?? body.sourceId ?? 'default'),
+        boundBrainId: body.boundBrainId || body.bound_brain_id ? String(body.boundBrainId ?? body.bound_brain_id) : undefined,
+        boundSlugPrefixes: asStrings('boundSlugPrefixes', 'bound_slug_prefixes'),
+        boundMaxConcurrent: body.boundMaxConcurrent === undefined && body.bound_max_concurrent === undefined
+          ? undefined : Number(body.boundMaxConcurrent ?? body.bound_max_concurrent),
+        budgetUsdPerDay: body.budgetUsdPerDay === undefined && body.budget_usd_per_day === undefined
+          ? undefined : String(body.budgetUsdPerDay ?? body.budget_usd_per_day),
+        allowedProviders: asStrings('allowedProviders', 'allowed_providers'),
+        allowedModels: asStrings('allowedModels', 'allowed_models'),
+      };
+      const ttl = tokenTtl === undefined || tokenTtl === null ? undefined : Number(tokenTtl);
+      if (ttl !== undefined && (!Number.isInteger(ttl) || ttl <= 0)) {
+        res.status(400).json({ error: 'invalid_token_ttl' }); return;
       }
+      const result = await oauthProvider.registerClientManual(
+        name, grants, scopeString, uris, agentBindings.boundSourceId, undefined,
+        validatedAuthMethod, agentBindings, ttl,
+      );
       res.json({ ...result, tokenTtl: tokenTtl ? Number(tokenTtl) : null });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Registration failed' });
+      res.status(400).json({
+        error: 'invalid_client_registration',
+        message: e instanceof Error ? e.message : 'Registration failed',
+      });
     }
   });
 

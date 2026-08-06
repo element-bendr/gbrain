@@ -28,6 +28,10 @@ import { assertValidSourceId } from './source-id.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
+import {
+  validateAgentClientBindings,
+  type AgentClientBindings,
+} from './agent-client-bindings.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -63,14 +67,7 @@ export function assertValidSlugPrefixes(prefixes: readonly string[]): void {
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
-export interface AgentClientBindings {
-  boundTools?: string[];
-  boundSourceId?: string;
-  boundBrainId?: string;
-  boundSlugPrefixes?: string[];
-  boundMaxConcurrent?: number;
-  budgetUsdPerDay?: string;
-}
+export type { AgentClientBindings } from './agent-client-bindings.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -982,6 +979,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     federatedRead?: string[],
     tokenEndpointAuthMethod?: string,
     agentBindings?: AgentClientBindings,
+    tokenTtlSeconds?: number,
   ): Promise<{ clientId: string; clientSecret?: string }> {
     // v0.28: ALLOWED_SCOPES allowlist. Reject `--scopes "read flying-unicorn"`
     // at registration so meaningless scope strings can't pile up in the DB.
@@ -989,19 +987,14 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // existing rows aren't re-validated).
     assertAllowedScopes(parseScopeString(scopes));
 
-    // A bound_slug_prefixes entry that is empty or whitespace-only makes
-    // `startsWith` true for every slug — a binding that looks set in
-    // `auth list` and the admin UI while fencing nothing. Reject at
-    // registration, the same way source ids are validated.
-    if (agentBindings?.boundSlugPrefixes) {
-      // Same rule as rescopeClient: an empty list is ambiguous. It registers
-      // as deny-all for every direct write while printing an empty binding
-      // line, so an operator cannot tell it from an unbound client.
-      if (agentBindings.boundSlugPrefixes.length === 0) {
-        throw new Error('--bound-slug-prefixes cannot be an empty list (pass prefixes, or omit the flag for full-source write authority)');
-      }
-      assertValidSlugPrefixes(agentBindings.boundSlugPrefixes);
-    }
+    const bindings = agentBindings
+      ? await validateAgentClientBindings(this.sql, agentBindings, sourceId)
+      : null;
+    const governedBindings = agentBindings && (
+      agentBindings.controlCapabilities !== undefined ||
+      agentBindings.allowedProviders !== undefined ||
+      agentBindings.allowedModels !== undefined
+    );
 
     // v0.41.3 (T1+T2): validate token_endpoint_auth_method at the registration
     // boundary. Throws InvalidTokenEndpointAuthMethodError on bad input.
@@ -1028,7 +1021,27 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     //                    has read scope == write scope, the v0.33 default)
     const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
     try {
-      if (agentBindings) {
+      if (bindings && governedBindings) {
+        await this.sql`
+          INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                      grant_types, scope, token_endpoint_auth_method,
+                                      client_id_issued_at,
+                                      source_id, federated_read,
+                                      bound_tools, bound_source_id, bound_brain_id,
+                                      bound_slug_prefixes, bound_max_concurrent, budget_usd_per_day,
+                                      control_capabilities, allowed_providers, allowed_models, token_ttl)
+          VALUES (${clientId}, ${secretHash}, ${name},
+                  ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${authMethod}, ${now},
+                  ${sourceId}, ${pgArray(federated)},
+                  ${pgArray(bindings.boundTools)},
+                  ${bindings.boundSourceId}, ${bindings.boundBrainId},
+                  ${pgArray(bindings.boundSlugPrefixes)},
+                  ${bindings.boundMaxConcurrent}, ${bindings.budgetUsdPerDay},
+                  ${pgArray(bindings.controlCapabilities)}, ${pgArray(bindings.allowedProviders)},
+                  ${pgArray(bindings.allowedModels)}, ${tokenTtlSeconds ?? null})
+        `;
+      } else if (bindings) {
+        // Backward-compatible projection for pre-v126 legacy binding callers.
         await this.sql`
           INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                       grant_types, scope, token_endpoint_auth_method,
@@ -1039,10 +1052,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           VALUES (${clientId}, ${secretHash}, ${name},
                   ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${authMethod}, ${now},
                   ${sourceId}, ${pgArray(federated)},
-                  ${agentBindings.boundTools ? pgArray(agentBindings.boundTools) : null},
-                  ${agentBindings.boundSourceId ?? null}, ${agentBindings.boundBrainId ?? null},
-                  ${agentBindings.boundSlugPrefixes ? pgArray(agentBindings.boundSlugPrefixes) : null},
-                  ${agentBindings.boundMaxConcurrent ?? 1}, ${agentBindings.budgetUsdPerDay ?? null})
+                  ${agentBindings?.boundTools ? pgArray(agentBindings.boundTools) : null},
+                  ${agentBindings?.boundSourceId ?? null}, ${agentBindings?.boundBrainId ?? null},
+                  ${agentBindings?.boundSlugPrefixes ? pgArray(agentBindings.boundSlugPrefixes) : null},
+                  ${agentBindings?.boundMaxConcurrent ?? 1}, ${agentBindings?.budgetUsdPerDay ?? null})
         `;
       } else {
         await this.sql`
@@ -1062,7 +1075,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         isUndefinedColumnError(err, 'bound_brain_id') ||
         isUndefinedColumnError(err, 'bound_slug_prefixes') ||
         isUndefinedColumnError(err, 'bound_max_concurrent') ||
-        isUndefinedColumnError(err, 'budget_usd_per_day')
+        isUndefinedColumnError(err, 'budget_usd_per_day') ||
+        isUndefinedColumnError(err, 'control_capabilities') ||
+        isUndefinedColumnError(err, 'allowed_providers') ||
+        isUndefinedColumnError(err, 'allowed_models')
       )) {
         throw new Error('register-client --bound-* flags require an up-to-date OAuth schema; run `gbrain apply-migrations --yes` and retry.');
       }

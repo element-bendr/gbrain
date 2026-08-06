@@ -195,6 +195,54 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(messages[1].message_idx).toBe(1);
   });
 
+  it('governed job forces the gateway path and installs durable owner/job budget context', async () => {
+    await engine.setConfig('agent.use_gateway_loop', 'false');
+    await engine.executeRaw(
+      `INSERT INTO oauth_clients
+         (client_id, client_name, client_secret_hash, scope, grant_types, redirect_uris,
+          token_endpoint_auth_method, budget_usd_per_day)
+       VALUES ('gbrain_cl_budgeted', 'budgeted', '', 'agent', ARRAY['client_credentials'],
+               ARRAY[]::text[], 'client_secret_post', 5.00)`,
+    );
+    __setChatTransportForTests(async () => ({
+      text: 'budgeted result',
+      blocks: [{ type: 'text', text: 'budgeted result' }] as ChatBlock[],
+      stopReason: 'end',
+      usage: { input_tokens: 12, output_tokens: 3, cache_read_tokens: 1, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-sonnet-4-6',
+      providerId: 'anthropic',
+    } satisfies ChatResult));
+
+    const handler = buildHandler(makeStubTools([]));
+    const { jobId, ctx } = await makeFakeJob({ prompt: 'hello', model: 'anthropic:claude-sonnet-4-6' });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET owner_client_id = 'gbrain_cl_budgeted', requested_job_budget_cents = 100,
+              correlation_id = 'handler-budget-test'
+        WHERE id = $1`,
+      [jobId],
+    );
+
+    expect((await handler(ctx)).result).toBe('budgeted result');
+    const reservations = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT client_id, job_id, status, attempt, actual_input_tokens, actual_output_tokens,
+              correlation_id, pricing_source
+         FROM mcp_spend_reservations WHERE job_id = $1`,
+      [jobId],
+    );
+    expect(reservations).toHaveLength(1);
+    expect(reservations[0]).toMatchObject({
+      client_id: 'gbrain_cl_budgeted',
+      job_id: jobId,
+      status: 'settled',
+      attempt: 1,
+      actual_input_tokens: 12,
+      actual_output_tokens: 3,
+      correlation_id: 'handler-budget-test',
+      pricing_source: 'built-in',
+    });
+  });
+
   it('happy path 2-turn with tool: dispatches, persists v2 stable ID, returns final text', async () => {
     let turn = 0;
     __setChatTransportForTests(async () => {
