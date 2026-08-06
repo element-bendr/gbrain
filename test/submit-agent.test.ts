@@ -215,9 +215,10 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         prompt: 'go', model,
       })).rejects.toMatchObject({ code: 'pricing_unavailable' });
 
-      const result = await callSubmitAgent(makeCtx({
-        clientId: 'local-policy', config: { chat_model: model },
-      }), { prompt: 'go', model });
+      await engine.setConfig('chat_model', model);
+      const result = await callSubmitAgent(makeCtx({ clientId: 'local-policy', config: {} }), {
+        prompt: 'go', model,
+      });
       expect(result.requested_model).toBe(model);
       expect(result.effective_model).toBe(model);
 

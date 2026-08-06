@@ -3478,7 +3478,10 @@ const submit_agent: Operation = {
     if (!chat?.supports_tools) {
       throw new OperationError('model_not_tool_capable', `Model "${effectiveModel}" cannot run the agent tool loop.`);
     }
-    const configuredModels = [ctx.config.chat_model, ...(ctx.config.chat_fallback_chain ?? [])]
+    const dbChatModel = ctx.config.chat_model === undefined
+      ? await ctx.engine.getConfig('chat_model').catch(() => null)
+      : null;
+    const configuredModels = [ctx.config.chat_model ?? dbChatModel, ...(ctx.config.chat_fallback_chain ?? [])]
       .filter((model): model is string => typeof model === 'string');
     const explicitlyConfigured = configuredModels.some(model => {
       try {
