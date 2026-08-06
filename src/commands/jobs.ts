@@ -253,6 +253,8 @@ USAGE
                Negative values need root.
   gbrain jobs supervisor status [--json] [--pid-file PATH]
   gbrain jobs supervisor stop [--json] [--pid-file PATH]
+  gbrain jobs service install [--cli-path PATH]
+  gbrain jobs service uninstall
 
     Auto-restarting wrapper around 'gbrain jobs work'. Spawns the worker
     as a child process and restarts on crash with exponential backoff
