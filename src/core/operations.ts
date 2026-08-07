@@ -31,6 +31,7 @@ import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import { ALL_SOURCES } from './source-id.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
+import { isUndefinedColumnError } from './utils.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -363,6 +364,12 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
   'submit_agent',
 ]);
 
+/** Owner-scoped control plane; each handler re-authorizes OAuth ownership. */
+export const OWNER_SCOPED_CONTROL_OPS: ReadonlySet<string> = new Set([
+  'get_owned_job', 'list_owned_jobs', 'cancel_owned_job',
+  'message_owned_job', 'get_owned_job_events',
+]);
+
 /**
  * Fail-closed gate for slug-bound clients, applied at dispatch (the single
  * choke point both MCP transports share) so it cannot be forgotten per op.
@@ -377,6 +384,7 @@ export function enforceBoundClientOpAllowList(
   // unfenceable ops stay reachable precisely when the fence is unreadable.
   const degraded = auth?.fenceProjectionDegraded === true;
   if (!degraded && !auth?.boundSlugPrefixes) return;
+  if (OWNER_SCOPED_CONTROL_OPS.has(op.name)) return;
   // Gate on "mutates, or carries any non-read scope" rather than on the two
   // literal scope strings 'write'/'admin': `sources_add` / `sources_remove`
   // carry the bespoke `sources_admin` scope and are `mutating: true`, so a
@@ -3380,11 +3388,15 @@ const submit_agent: Operation = {
   description: 'Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. Requires the `agent` OAuth scope. Tools, source, slug prefixes, max concurrency, and daily budget are bound at OAuth client registration time.',
   params: {
     prompt: { type: 'string', required: true, description: 'User prompt for the agent' },
-    model: { type: 'string', description: 'provider:model string (defaults to models.tier.subagent)' },
+    model: { type: 'string', required: true, description: 'Explicit provider:model string' },
     allowed_tools: { type: 'array', description: 'Subset of bound_tools the agent may invoke', items: { type: 'string' } },
     allowed_slug_prefixes: { type: 'array', description: 'Subset of bound_slug_prefixes for put_page writes', items: { type: 'string' } },
     max_turns: { type: 'number', description: 'Max LLM turns (default 20, hard cap 100)' },
     queue: { type: 'string', description: 'Queue name (default "default")' },
+    idempotency_key: { type: 'string', description: 'Owner-scoped retry key (max 128 chars)' },
+    per_job_budget_usd: { type: 'number', description: 'Optional budget that may only narrow the client daily cap' },
+    correlation_id: { type: 'string', description: 'Optional bounded trace ID; generated when absent' },
+    causation_id: { type: 'string', description: 'Optional bounded trace ID; never authority' },
   },
   mutating: true,
   scope: 'agent' as any,
@@ -3402,14 +3414,13 @@ const submit_agent: Operation = {
       throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
     }
 
-    // Load the binding row.
-    const { sqlQueryForEngine } = await import('./sql-query.ts');
-    const sql = sqlQueryForEngine(ctx.engine);
+    const { sql } = await requireAgentControl(ctx, 'submit_agent');
     let bindingRows: Array<Record<string, unknown>>;
     try {
       bindingRows = await sql`
         SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
-               bound_max_concurrent, budget_usd_per_day::text AS budget_cap
+               bound_max_concurrent, budget_usd_per_day::text AS budget_cap,
+               allowed_providers, allowed_models
           FROM oauth_clients
          WHERE client_id = ${clientId}
       `;
@@ -3428,12 +3439,86 @@ const submit_agent: Operation = {
     const boundSlugPrefixes = (binding.bound_slug_prefixes as string[] | null) ?? null;
     const boundMaxConcurrent = Number(binding.bound_max_concurrent ?? 1);
     const budgetCapText = (binding.budget_cap as string | null) ?? null;
+    const allowedProviders = (binding.allowed_providers as string[] | null) ?? [];
+    const allowedModels = (binding.allowed_models as string[] | null) ?? [];
 
     if (boundTools === null) {
       throw new OperationError(
         'permission_denied',
         `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
       );
+    }
+
+    // Governed callers choose one exact provider:model. Resolve aliases once,
+    // persist the requested/effective pair, and never consult a fallback chain.
+    const requestedModel = typeof p.model === 'string' ? p.model : '';
+    if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/.test(requestedModel)) {
+      throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
+    }
+    const { resolveRecipe, assertTouchpoint, isModelExplicitlyConfigured } = await import('./ai/model-resolver.ts');
+    let recipe: import('./ai/types.ts').Recipe;
+    let parsed: import('./ai/types.ts').ParsedModelId;
+    try {
+      ({ recipe, parsed } = resolveRecipe(requestedModel));
+    } catch (error) {
+      throw new OperationError(
+        'unknown_provider',
+        `submit_agent refused provider for "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try {
+      assertTouchpoint(recipe, 'chat', parsed.modelId);
+    } catch (error) {
+      throw new OperationError(
+        'unknown_model',
+        `submit_agent refused model "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const effectiveModel = `${parsed.providerId}:${parsed.modelId}`;
+    if (!allowedProviders.includes(parsed.providerId)) {
+      throw new OperationError('provider_not_allowed', `Provider "${parsed.providerId}" is not allowed for this OAuth client.`);
+    }
+    if (!allowedModels.includes(effectiveModel)) {
+      throw new OperationError('model_not_allowed', `Model "${effectiveModel}" is not allowed for this OAuth client.`);
+    }
+    const chat = recipe.touchpoints.chat;
+    if (!chat?.supports_tools) {
+      throw new OperationError('model_not_tool_capable', `Model "${effectiveModel}" cannot run the agent tool loop.`);
+    }
+    const dbChatModel = ctx.config.chat_model === undefined
+      ? await ctx.engine.getConfig('chat_model').catch(() => null)
+      : null;
+    const configuredModels = [ctx.config.chat_model ?? dbChatModel, ...(ctx.config.chat_fallback_chain ?? [])]
+      .filter((model): model is string => typeof model === 'string');
+    const explicitlyConfigured = isModelExplicitlyConfigured(effectiveModel, configuredModels);
+    if (!(chat.models ?? []).includes(parsed.modelId) && !explicitlyConfigured) {
+      throw new OperationError(
+        'unknown_model',
+        `Model "${effectiveModel}" is not in the provider's static chat catalog or explicit operator configuration.`,
+      );
+    }
+    const enabledProvidersRaw = await ctx.engine.getConfig('agent.enabled_providers').catch(() => null);
+    if (enabledProvidersRaw !== null) {
+      const enabledProviders = enabledProvidersRaw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+      if (!enabledProviders.includes(parsed.providerId)) {
+        throw new OperationError('provider_disabled', `Provider "${parsed.providerId}" is disabled by agent.enabled_providers.`);
+      }
+    }
+    const { buildGatewayConfig } = await import('./ai/build-gateway-config.ts');
+    const gatewayConfig = buildGatewayConfig(ctx.config);
+    const missingCredentials = (recipe.auth_env?.required ?? []).filter(name => !gatewayConfig.env[name]);
+    if (missingCredentials.length > 0) {
+      throw new OperationError(
+        'provider_credentials_missing',
+        `Provider "${parsed.providerId}" is missing required credential configuration: ${missingCredentials.join(', ')}.`,
+      );
+    }
+    const { quoteBudgetUsage } = await import('./budget/budget-tracker.ts');
+    const price = quoteBudgetUsage(effectiveModel, 1, 1, 'chat');
+    const zeroPriced = price?.inputRateUsdPerMTok === 0 && price.outputRateUsdPerMTok === 0;
+    const approvedLocalZeroPrice = parsed.providerId === 'ollama' && explicitlyConfigured;
+    if (!price || (zeroPriced && !approvedLocalZeroPrice)) {
+      throw new OperationError('pricing_unavailable', `No approved pricing is configured for model "${effectiveModel}".`);
     }
 
     // Validate each param against the binding.
@@ -3496,20 +3581,32 @@ const submit_agent: Operation = {
       }
     }
 
-    // Concurrency cap: count active+waiting agent jobs for this client.
-    const inflight = await sql`
-      SELECT COUNT(*)::int AS n
-        FROM minion_jobs j
-       WHERE j.name = 'subagent'
-         AND j.status IN ('waiting', 'active', 'waiting-children')
-         AND j.data->>'__owner_client_id' = ${clientId}
-    `;
-    const inflightCount = Number((inflight[0]?.n as number | string | undefined) ?? 0);
-    if (inflightCount >= boundMaxConcurrent) {
+    const tracePattern = /^[A-Za-z0-9._:-]{1,64}$/;
+    const { createHash, randomUUID } = await import('crypto');
+    const correlationId = typeof p.correlation_id === 'string' ? p.correlation_id : randomUUID();
+    const causationId = typeof p.causation_id === 'string' ? p.causation_id : undefined;
+    if (!tracePattern.test(correlationId) || (causationId && !tracePattern.test(causationId))) {
+      throw new OperationError('invalid_params', 'Trace IDs must be 1-64 characters from [A-Za-z0-9._:-].');
+    }
+    const idempotencyKey = typeof p.idempotency_key === 'string' ? p.idempotency_key : undefined;
+    if (idempotencyKey !== undefined && (idempotencyKey.length < 1 || idempotencyKey.length > 128 || idempotencyKey.trim() !== idempotencyKey)) {
+      throw new OperationError('invalid_params', 'idempotency_key must be 1-128 characters without surrounding whitespace.');
+    }
+    const dailyBudgetCents = budgetCapText === null ? null : Math.round(Number(budgetCapText) * 100);
+    if (dailyBudgetCents === null) {
       throw new OperationError(
-        'rate_limited',
-        `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`,
+        'budget_policy_missing',
+        'submit_agent requires a registered daily budget for durable gateway enforcement.',
       );
+    }
+    const requestedBudget = p.per_job_budget_usd;
+    const requestedJobBudgetCents = requestedBudget === undefined
+      ? undefined : Math.round(Number(requestedBudget) * 100);
+    if (requestedJobBudgetCents !== undefined && (
+      !Number.isSafeInteger(requestedJobBudgetCents) || requestedJobBudgetCents < 0 ||
+      requestedJobBudgetCents > dailyBudgetCents
+    )) {
+      throw new OperationError('invalid_params', 'per_job_budget_usd must be non-negative and no greater than the registered daily budget.');
     }
 
     // Dry-run echo.
@@ -3533,6 +3630,8 @@ const submit_agent: Operation = {
         // is applied — a preview that hides this can't show a widening bug.
         resolved_tools: requestedTools,
         resolved_slug_prefixes: delegatedSlugPrefixes,
+        requested_model: requestedModel,
+        effective_model: effectiveModel,
       };
     }
 
@@ -3548,8 +3647,10 @@ const submit_agent: Operation = {
       allowed_tools: requestedTools,
       allowed_slug_prefixes: delegatedSlugPrefixes,
       __owner_client_id: clientId,
+      correlation_id: correlationId,
+      causation_id: causationId,
     };
-    if (typeof p.model === 'string') jobData.model = p.model;
+    jobData.model = effectiveModel;
     // Write source for the delegated job comes from the AUTHENTICATED client
     // whenever we have it. `bound_source_id` is an optional, separately-set
     // column: unset it defaulted the child to 'default', and if it disagreed
@@ -3564,12 +3665,43 @@ const submit_agent: Operation = {
       );
     }
     if (delegatedSource) jobData.source_id = delegatedSource;
-    const job = await queue.add(
-      'subagent',
-      jobData,
-      { queue: (p.queue as string) || 'default' },
-      { allowProtectedSubmit: true },
-    );
+    const requestFingerprint = createHash('sha256').update(JSON.stringify({
+      prompt_sha256: createHash('sha256').update(String(p.prompt)).digest('hex'),
+      model: requestedModel,
+      tools: requestedTools,
+      slug_prefixes: delegatedSlugPrefixes,
+      max_turns: jobData.max_turns,
+      queue: (p.queue as string) || 'default',
+      per_job_budget_cents: requestedJobBudgetCents ?? null,
+    })).digest('hex');
+    let job;
+    try {
+      job = await queue.add(
+        'subagent',
+        jobData,
+        { queue: (p.queue as string) || 'default' },
+        {
+          allowProtectedSubmit: true,
+          agentAdmission: {
+            ownerClientId: clientId,
+            maxConcurrent: boundMaxConcurrent,
+            idempotencyKey,
+            requestFingerprint,
+            correlationId,
+            causationId,
+            requestedModel,
+            effectiveModel,
+            requestedJobBudgetCents,
+          },
+        },
+      );
+    } catch (error) {
+      const { MinionAdmissionError } = await import('./minions/queue.ts');
+      if (error instanceof MinionAdmissionError) {
+        throw new OperationError(error.code, error.message);
+      }
+      throw error;
+    }
 
     // Audit trail (D4) — best-effort JSONL.
     try {
@@ -3579,7 +3711,9 @@ const submit_agent: Operation = {
       logAgentSubmission({
         client_id: clientId,
         job_id: job.id,
-        model: typeof p.model === 'string' ? p.model : '<default>',
+        model: effectiveModel,
+        requested_model: requestedModel,
+        effective_model: effectiveModel,
         bound_tools: requestedTools,
         bound_source: boundSource,
         slug_prefixes: requestedSlugPrefixes,
@@ -3590,7 +3724,178 @@ const submit_agent: Operation = {
       });
     } catch { /* never block submission */ }
 
-    return { id: job.id, name: 'subagent', client_id: clientId };
+    return {
+      id: job.id,
+      name: 'subagent',
+      client_id: clientId,
+      correlation_id: correlationId,
+      requested_model: requestedModel,
+      effective_model: effectiveModel,
+    };
+  },
+};
+
+async function requireAgentControl(
+  ctx: OperationContext,
+  capability: string,
+): Promise<{ clientId: string; sql: ReturnType<typeof import('./sql-query.ts')['sqlQueryForEngine']> }> {
+  const clientId = ctx.auth?.clientId;
+  if (!clientId?.startsWith('gbrain_cl_') || ctx.remote === false) {
+    throw new OperationError('permission_denied', 'Authenticated OAuth transport required.');
+  }
+  const { sqlQueryForEngine } = await import('./sql-query.ts');
+  const sql = sqlQueryForEngine(ctx.engine);
+  const rows = await sql`
+    SELECT control_capabilities FROM oauth_clients WHERE client_id = ${clientId}
+  `;
+  const capabilities = (rows[0]?.control_capabilities as string[] | undefined) ?? [];
+  if (!capabilities.includes(capability)) {
+    throw new OperationError('permission_denied', `OAuth client is not bound to ${capability}.`);
+  }
+  return { clientId, sql };
+}
+
+async function ownedJobId(
+  sql: ReturnType<typeof import('./sql-query.ts')['sqlQueryForEngine']>,
+  clientId: string,
+  id: number,
+): Promise<boolean> {
+  const rows = await sql`
+    SELECT 1 FROM minion_jobs WHERE id = ${id} AND owner_client_id = ${clientId} LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+const get_owned_job: Operation = {
+  name: 'get_owned_job',
+  description: 'Get one job owned by the authenticated OAuth client.',
+  params: { id: { type: 'number', required: true, description: 'Owned job ID' } },
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    const { clientId, sql } = await requireAgentControl(ctx, 'get_owned_job');
+    const id = Number(p.id);
+    if (!await ownedJobId(sql, clientId, id)) {
+      throw new OperationError('invalid_params', 'Owned job unavailable.');
+    }
+    const { MinionQueue } = await import('./minions/queue.ts');
+    return new MinionQueue(ctx.engine).getJob(id);
+  },
+};
+
+const list_owned_jobs: Operation = {
+  name: 'list_owned_jobs',
+  description: 'List jobs owned by the authenticated OAuth client.',
+  params: {
+    status: { type: 'string', description: 'Optional status filter' },
+    limit: { type: 'number', description: 'Maximum 100 jobs' },
+  },
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    const { clientId } = await requireAgentControl(ctx, 'list_owned_jobs');
+    const limit = Math.max(1, Math.min(Number(p.limit ?? 50), 100));
+    const status = typeof p.status === 'string' ? p.status : null;
+    return ctx.engine.executeRaw(
+      `SELECT * FROM minion_jobs
+        WHERE owner_client_id = $1 AND ($2::text IS NULL OR status = $2)
+        ORDER BY id DESC LIMIT $3`,
+      [clientId, status, limit],
+    );
+  },
+};
+
+const cancel_owned_job: Operation = {
+  name: 'cancel_owned_job',
+  description: 'Idempotently cancel a job owned by the authenticated OAuth client.',
+  params: { id: { type: 'number', required: true, description: 'Owned job ID' } },
+  mutating: true,
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    const { clientId, sql } = await requireAgentControl(ctx, 'cancel_owned_job');
+    const id = Number(p.id);
+    const rows = await sql`
+      SELECT status FROM minion_jobs WHERE id = ${id} AND owner_client_id = ${clientId} LIMIT 1
+    `;
+    if (rows.length === 0) throw new OperationError('invalid_params', 'Owned job unavailable.');
+    if (rows[0].status === 'cancelled') return { id, status: 'cancelled', already_cancelled: true };
+    const { MinionQueue } = await import('./minions/queue.ts');
+    const cancelled = await new MinionQueue(ctx.engine).cancelJob(id);
+    if (!cancelled) throw new OperationError('invalid_params', 'Owned job is not cancellable.');
+    await sql`
+      INSERT INTO minion_job_events(job_id, owner_client_id, event_type)
+      VALUES (${id}, ${clientId}, 'cancelled')
+    `;
+    return cancelled;
+  },
+};
+
+const message_owned_job: Operation = {
+  name: 'message_owned_job',
+  description: 'Send a bounded message to a non-terminal owned job.',
+  params: {
+    id: { type: 'number', required: true, description: 'Owned job ID' },
+    payload: { type: 'object', required: true, description: 'Message payload' },
+  },
+  mutating: true,
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    const { clientId } = await requireAgentControl(ctx, 'message_owned_job');
+    const id = Number(p.id);
+    const encoded = JSON.stringify(p.payload);
+    if (Buffer.byteLength(encoded, 'utf8') > 65_536) {
+      throw new OperationError('invalid_params', 'Message payload exceeds 64 KiB.');
+    }
+    const { executeRawJsonb } = await import('./sql-query.ts');
+    const rows = await executeRawJsonb<Record<string, unknown>>(
+      ctx.engine,
+      `INSERT INTO minion_inbox(job_id, sender, payload)
+       SELECT id, $3, $4::jsonb FROM minion_jobs
+        WHERE id = $1 AND owner_client_id = $2
+          AND status NOT IN ('completed','failed','dead','cancelled')
+       RETURNING id`,
+      [id, clientId, `oauth:${clientId}`],
+      [p.payload],
+    );
+    if (rows.length === 0) throw new OperationError('invalid_params', 'Owned job unavailable or terminal.');
+    return { sent: true, message_id: rows[0].id, job_id: id };
+  },
+};
+
+const get_owned_job_events: Operation = {
+  name: 'get_owned_job_events',
+  description: 'Retrieve bounded owned-job events after a numeric cursor.',
+  params: {
+    id: { type: 'number', required: true, description: 'Owned job ID' },
+    cursor: { type: 'number', description: 'Last event ID already seen' },
+    limit: { type: 'number', description: 'Maximum 100 events' },
+  },
+  scope: 'agent' as any,
+  handler: async (ctx, p) => {
+    const { clientId, sql } = await requireAgentControl(ctx, 'get_owned_job_events');
+    const id = Number(p.id);
+    const cursor = Number(p.cursor ?? 0);
+    const limit = Math.max(1, Math.min(Number(p.limit ?? 50), 100));
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new OperationError('invalid_params', 'Event cursor must be a non-negative safe integer.');
+    }
+    if (!await ownedJobId(sql, clientId, id)) {
+      throw new OperationError('invalid_params', 'Owned job unavailable.');
+    }
+    const events = await ctx.engine.executeRaw<Record<string, unknown>>(
+      `SELECT id, event_type, correlation_id, payload, created_at
+         FROM minion_job_events
+        WHERE owner_client_id = $1 AND job_id = $2 AND id > $3
+        ORDER BY id ASC LIMIT $4`,
+      [clientId, id, cursor, limit],
+    );
+    const normalizedEvents = events.map(event => {
+      const eventId = Number(event.id);
+      if (!Number.isSafeInteger(eventId) || eventId < 1) {
+        throw new OperationError('database_error', 'Event ID exceeds the supported safe-integer cursor range.');
+      }
+      return { ...event, id: eventId };
+    });
+    const nextCursor = normalizedEvents.length === 0 ? cursor : normalizedEvents[normalizedEvents.length - 1].id;
+    return { job_id: id, cursor, limit, events: normalizedEvents, next_cursor: nextCursor };
   },
 };
 
@@ -4254,6 +4559,22 @@ const whoami: Operation = {
     // at oauth-provider.ts:417-430). Detect by inspecting the prefix.
     const isOauth = ctx.auth.clientId.startsWith('gbrain_cl_');
     if (isOauth) {
+      let bindings: Record<string, unknown> = {};
+      if (typeof ctx.engine.executeRaw === 'function') {
+        try {
+          const rows = await ctx.engine.executeRaw<Record<string, unknown>>(
+            `SELECT control_capabilities, bound_tools, bound_source_id, bound_slug_prefixes,
+                    bound_max_concurrent, budget_usd_per_day::text AS budget_usd_per_day,
+                    allowed_providers, allowed_models
+               FROM oauth_clients WHERE client_id = $1`,
+            [ctx.auth.clientId],
+          );
+          bindings = rows[0] ?? {};
+        } catch (error) {
+          if (!isUndefinedColumnError(error, 'control_capabilities')) throw error;
+          // Pre-v126 clients remain introspectable with fail-closed empty bindings.
+        }
+      }
       return {
         transport: 'oauth',
         client_id: ctx.auth.clientId,
@@ -4264,6 +4585,14 @@ const whoami: Operation = {
         // widens nothing; absent grants serialize fail-closed (null / []).
         source_id: ctx.auth.sourceId ?? null,
         federated_read: ctx.auth.allowedSources ?? [],
+        control_plane_capabilities: bindings.control_capabilities ?? [],
+        bound_inherited_agent_tools: bindings.bound_tools ?? [],
+        bound_source_id: bindings.bound_source_id ?? null,
+        bound_slug_prefixes: bindings.bound_slug_prefixes ?? [],
+        max_concurrent_inflight_jobs: Number(bindings.bound_max_concurrent ?? 1),
+        daily_budget_usd: bindings.budget_usd_per_day ?? null,
+        provider_allowlist: bindings.allowed_providers ?? [],
+        model_allowlist: bindings.allowed_models ?? [],
       };
     }
     return {
@@ -6171,7 +6500,8 @@ export const operations: Operation[] = [
   submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,
   // v0.38 Slice 3: remote-callable agent dispatch with OAuth-bound trust boundary
-  submit_agent,
+  submit_agent, get_owned_job, list_owned_jobs, cancel_owned_job,
+  message_owned_job, get_owned_job_events,
   // Orphans
   find_orphans,
   // v0.36.1.0 (T7) — Hindsight calibration wave: read profile via MCP

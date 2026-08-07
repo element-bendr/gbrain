@@ -34,8 +34,18 @@ import { z } from 'zod';
 import {
   BudgetTracker,
   extractUsageFromError as _extractUsageFromError,
+  extractReportedUsageFromError,
+  quoteBudgetUsage,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
+import {
+  reserve as reserveDurableSpend,
+  settle as settleDurableSpend,
+  release as releaseDurableSpend,
+  BudgetExceededError,
+  type Reservation as DurableSpendReservation,
+} from '../minions/budget-meter.ts';
+import { splitProviderModelId } from '../model-id.ts';
 
 import type {
   AIGatewayConfig,
@@ -2695,12 +2705,140 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
 
 const __budgetStore = new AsyncLocalStorage<BudgetTracker>();
 
+export interface GatewaySpendContext {
+  engine: BrainEngine;
+  clientId: string;
+  jobId: number;
+  dailyCapCents: number;
+  jobCapCents?: number;
+  correlationId: string;
+  /** Zero-cost execution requires an explicit operator-approved rate. */
+  allowZeroPrice?: boolean;
+}
+
+interface GatewaySpendHold {
+  context: GatewaySpendContext;
+  reservation: DurableSpendReservation;
+  model: string;
+}
+
+const __gatewaySpendStore = new AsyncLocalStorage<GatewaySpendContext>();
+
 export function withBudgetTracker<T>(tracker: BudgetTracker, fn: () => Promise<T>): Promise<T> {
   return __budgetStore.run(tracker, fn);
 }
 
 export function getCurrentBudgetTracker(): BudgetTracker | null {
   return __budgetStore.getStore() ?? null;
+}
+
+export function withGatewaySpendContext<T>(
+  context: GatewaySpendContext,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return __gatewaySpendStore.run(context, fn);
+}
+
+export function getCurrentGatewaySpendContext(): GatewaySpendContext | null {
+  return __gatewaySpendStore.getStore() ?? null;
+}
+
+async function reserveGatewayChatSpend(
+  model: string,
+  estimatedInputTokens: number,
+  maxOutputTokens: number,
+): Promise<GatewaySpendHold | null> {
+  const context = getCurrentGatewaySpendContext();
+  if (!context) return null;
+  const parsed = splitProviderModelId(model);
+  const quote = quoteBudgetUsage(model, estimatedInputTokens, maxOutputTokens, 'chat');
+  if (!parsed.provider || !parsed.model || !quote || (
+    !context.allowZeroPrice && quote.inputRateUsdPerMTok === 0 && quote.outputRateUsdPerMTok === 0
+  )) {
+    const error = new BudgetExceededError(
+      `governed gateway pricing unavailable for model "${model}"; provider call refused`,
+      0,
+      Math.min(context.dailyCapCents, context.jobCapCents ?? context.dailyCapCents),
+    );
+    await recordGatewayBudgetRefusal(context, error, model);
+    throw error;
+  }
+  try {
+    const reservation = await reserveDurableSpend(context.engine, {
+      clientId: context.clientId,
+      jobId: context.jobId,
+      estimatedCents: quote.costUsd * 100,
+      capCents: context.dailyCapCents,
+      jobCapCents: context.jobCapCents,
+      model,
+      provider: parsed.provider,
+      correlationId: context.correlationId,
+      estimatedInputTokens,
+      maxOutputTokens,
+      pricingSource: quote.source,
+      pricingVersion: quote.version,
+    });
+    return { context, reservation, model };
+  } catch (error) {
+    if (error instanceof BudgetExceededError) {
+      await recordGatewayBudgetRefusal(context, error, model);
+    }
+    throw error;
+  }
+}
+
+async function settleGatewayChatSpend(
+  hold: GatewaySpendHold | null,
+  usage: ChatResult['usage'],
+): Promise<void> {
+  if (!hold) return;
+  const quote = quoteBudgetUsage(hold.model, usage.input_tokens, usage.output_tokens, 'chat');
+  if (!quote) throw new Error(`pricing disappeared while settling model "${hold.model}"`);
+  await settleDurableSpend(
+    hold.context.engine,
+    hold.reservation.reservationId,
+    quote.costUsd * 100,
+    'governed_agent_gateway',
+    null,
+    {
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      cacheReadTokens: usage.cache_read_tokens,
+      cacheCreationTokens: usage.cache_creation_tokens,
+    },
+  );
+}
+
+async function settleGatewayChatFailure(hold: GatewaySpendHold | null, error: unknown): Promise<void> {
+  if (!hold) return;
+  const usage = extractReportedUsageFromError(error);
+  if (!usage) {
+    await releaseDurableSpend(hold.context.engine, hold.reservation.reservationId);
+    return;
+  }
+  await settleGatewayChatSpend(hold, {
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+  });
+}
+
+async function recordGatewayBudgetRefusal(
+  context: GatewaySpendContext,
+  error: BudgetExceededError,
+  model: string,
+): Promise<void> {
+  await context.engine.executeRaw(
+    `INSERT INTO minion_job_events(job_id, owner_client_id, event_type, correlation_id, payload)
+     VALUES ($1, $2, 'budget_refused', $3, $4::text::jsonb)`,
+    [context.jobId, context.clientId, context.correlationId, JSON.stringify({
+      code: error.code,
+      model,
+      spent_cents: error.spentCents,
+      cap_cents: error.capCents,
+    })],
+  );
 }
 
 /** Internal helper: estimate input tokens from messages + system. Heuristic only
@@ -3314,6 +3452,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   // touching provider resolution, AI SDK, or any network. See
   // __setChatTransportForTests. Production paths see _chatTransport === null.
   if (_chatTransport) {
+    const durableHold = await reserveGatewayChatSpend(modelStrEarly, estimatedInputTokens, maxOutputTokens);
     let res: ChatResult | null = null;
     let threw: unknown = null;
     try {
@@ -3351,6 +3490,8 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
           // is rare in practice.
         }
       }
+      if (res) await settleGatewayChatSpend(durableHold, res.usage);
+      else await settleGatewayChatFailure(durableHold, threw);
     }
   }
 
@@ -3468,9 +3609,14 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
         role: 'system' as const,
         content: opts.system,
         providerOptions: { anthropic: { cacheControl: cacheControlValue } },
-      }
+    }
     : opts.system;
 
+  const durableHold = await reserveGatewayChatSpend(
+    `${recipe.id}:${modelId}`,
+    estimatedInputTokens,
+    maxOutputTokens,
+  );
   try {
     const result = await _generateTextTransport({
       model,
@@ -3524,6 +3670,13 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const outTok = Number(usage.outputTokens ?? usage.completionTokens ?? 0);
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
 
+    await settleGatewayChatSpend(durableHold, {
+      input_tokens: inTok,
+      output_tokens: outTok,
+      cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
+      cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+    });
+
     return {
       text: blocks.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join(''),
       blocks,
@@ -3549,6 +3702,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       outputTokens: maxOutputTokens,
     });
     _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
+    await settleGatewayChatFailure(durableHold, err);
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
   }
 }

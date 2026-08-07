@@ -37,6 +37,8 @@ export interface AgentAuditEvent {
   client_id: string;
   job_id: number;
   model: string;
+  requested_model?: string;
+  effective_model?: string;
   bound_tools: string[];
   bound_source: string | null;
   slug_prefixes: string[];

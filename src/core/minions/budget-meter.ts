@@ -45,12 +45,26 @@ export interface ReserveOpts {
   model: string;
   provider: string;
   jobId?: number;
+  jobCapCents?: number;
+  correlationId?: string;
+  estimatedInputTokens?: number;
+  maxOutputTokens?: number;
+  pricingSource?: string;
+  pricingVersion?: string;
 }
 
 export interface Reservation {
   reservationId: string;
   estimatedCents: number;
+  attempt: number;
   ttlMs: number;
+}
+
+export interface SettlementUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
 }
 
 /**
@@ -78,12 +92,28 @@ export async function reserve(
   if (opts.jobId !== undefined && (!Number.isSafeInteger(opts.jobId) || opts.jobId <= 0)) {
     throw new TypeError('jobId must be a positive safe integer when provided');
   }
+  if (opts.jobCapCents !== undefined) {
+    assertFiniteNonNegative('jobCapCents', opts.jobCapCents);
+    if (opts.jobId === undefined) throw new TypeError('jobCapCents requires jobId');
+  }
+  if (opts.correlationId !== undefined && !/^[A-Za-z0-9._:-]{1,64}$/.test(opts.correlationId)) {
+    throw new TypeError('correlationId must be 1-64 characters from [A-Za-z0-9._:-]');
+  }
+  for (const [name, value] of [
+    ['estimatedInputTokens', opts.estimatedInputTokens],
+    ['maxOutputTokens', opts.maxOutputTokens],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new TypeError(`${name} must be a non-negative safe integer`);
+    }
+  }
 
   const reservationId = randomUUIDv7();
   const lockKey = clientLockKey(opts.clientId);
   const expiresAt = new Date(Date.now() + RESERVATION_TTL_MS);
   const todayStart = todayStartIso();
 
+  let attempt = 1;
   await engine.transaction(async (tx) => {
     const sql = sqlQueryForEngine(tx);
 
@@ -119,7 +149,24 @@ export async function reserve(
            WHERE client_id = ${opts.clientId}
              AND status = 'pending'
              AND created_at >= ${todayStart}
-        ), '0') AS pending_text
+        ), '0') AS pending_text,
+        COALESCE((
+          SELECT SUM(actual_cents)::text
+            FROM mcp_spend_reservations
+           WHERE job_id = ${opts.jobId ?? null}
+             AND status = 'settled'
+        ), '0') AS job_committed_text,
+        COALESCE((
+          SELECT SUM(estimated_cents)::text
+            FROM mcp_spend_reservations
+           WHERE job_id = ${opts.jobId ?? null}
+             AND status = 'pending'
+        ), '0') AS job_pending_text,
+        COALESCE((
+          SELECT MAX(attempt)
+            FROM mcp_spend_reservations
+           WHERE job_id = ${opts.jobId ?? null}
+        ), 0)::int + 1 AS next_attempt
     `;
     const committedCents = requiredFiniteTotal(rows[0]?.committed_text, 'committed spend');
     const pendingCents = requiredFiniteTotal(rows[0]?.pending_text, 'pending spend');
@@ -133,20 +180,36 @@ export async function reserve(
         opts.capCents,
       );
     }
+    const jobCommittedCents = requiredFiniteTotal(rows[0]?.job_committed_text, 'job committed spend');
+    const jobPendingCents = requiredFiniteTotal(rows[0]?.job_pending_text, 'job pending spend');
+    if (opts.jobCapCents !== undefined && jobCommittedCents + jobPendingCents + opts.estimatedCents > opts.jobCapCents) {
+      throw new BudgetExceededError(
+        `job budget exceeded for job ${opts.jobId}: committed=${jobCommittedCents.toFixed(2)}¢, ` +
+        `pending=${jobPendingCents.toFixed(2)}¢, estimated=${opts.estimatedCents.toFixed(2)}¢, ` +
+        `cap=${opts.jobCapCents.toFixed(2)}¢`,
+        jobCommittedCents + jobPendingCents,
+        opts.jobCapCents,
+      );
+    }
+    attempt = opts.jobId === undefined ? 1 : Number(rows[0]?.next_attempt ?? 1);
 
     // Step 4: INSERT reservation before releasing the client lock.
     await sql`
       INSERT INTO mcp_spend_reservations
-        (reservation_id, client_id, job_id, estimated_cents, model, provider, status, expires_at)
+        (reservation_id, client_id, job_id, estimated_cents, model, provider, status, expires_at,
+         attempt, correlation_id, estimated_input_tokens, max_output_tokens, pricing_source, pricing_version)
       VALUES
         (${reservationId}, ${opts.clientId}, ${opts.jobId ?? null},
-         ${opts.estimatedCents}, ${opts.model}, ${opts.provider}, 'pending', ${expiresAt})
+         ${opts.estimatedCents}, ${opts.model}, ${opts.provider}, 'pending', ${expiresAt},
+         ${attempt}, ${opts.correlationId ?? null}, ${opts.estimatedInputTokens ?? null},
+         ${opts.maxOutputTokens ?? null}, ${opts.pricingSource ?? 'legacy'}, ${opts.pricingVersion ?? 'legacy'})
     `;
   });
 
   return {
     reservationId,
     estimatedCents: opts.estimatedCents,
+    attempt,
     ttlMs: RESERVATION_TTL_MS,
   };
 }
@@ -162,6 +225,7 @@ export async function settle(
   actualCents: number,
   operation: string = 'subagent_loop',
   tokenName: string | null = null,
+  usage: SettlementUsage = {},
 ): Promise<void> {
   assertNonEmpty('reservationId', reservationId);
   assertFiniteNonNegative('actualCents', actualCents);
@@ -178,6 +242,10 @@ export async function settle(
       UPDATE mcp_spend_reservations
          SET status = 'settled',
              actual_cents = ${actualCents},
+             actual_input_tokens = ${usage.inputTokens ?? null},
+             actual_output_tokens = ${usage.outputTokens ?? null},
+             actual_cache_read_tokens = ${usage.cacheReadTokens ?? null},
+             actual_cache_creation_tokens = ${usage.cacheCreationTokens ?? null},
              settled_at = now()
        WHERE reservation_id = ${reservationId}
          AND status IN ('pending', 'expired')
@@ -202,6 +270,24 @@ export async function settle(
          ${String(row.provider)}, ${String(row.model)})
     `;
   });
+}
+
+/** Release an unused pending hold. Idempotent; never writes fictional spend. */
+export async function release(engine: BrainEngine, reservationId: string): Promise<void> {
+  assertNonEmpty('reservationId', reservationId);
+  const sql = sqlQueryForEngine(engine);
+  const rows = await sql`
+    UPDATE mcp_spend_reservations
+       SET status = 'released', actual_cents = 0, settled_at = now()
+     WHERE reservation_id = ${reservationId} AND status = 'pending'
+    RETURNING reservation_id
+  `;
+  if (rows.length > 0) return;
+  const existing = await sql`
+    SELECT status FROM mcp_spend_reservations WHERE reservation_id = ${reservationId}
+  `;
+  if (['released', 'settled', 'expired'].includes(String(existing[0]?.status))) return;
+  throw new Error(`spend reservation not found: ${reservationId}`);
 }
 
 /**

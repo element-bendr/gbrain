@@ -17,7 +17,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   operations, OperationError, slugUnderBoundPrefixes,
-  enforceBoundClientOpAllowList, CLIENT_FENCED_WRITE_OPS,
+  enforceBoundClientOpAllowList, CLIENT_FENCED_WRITE_OPS, OWNER_SCOPED_CONTROL_OPS,
 } from '../src/core/operations.ts';
 import type { OperationContext, Operation, AuthInfo } from '../src/core/operations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -182,6 +182,16 @@ describe('client slug fence (bound_slug_prefixes on direct writes)', () => {
         const o = operations.find(x => x.name === name);
         if (!o) throw new Error(`${name} missing from operations`);
         expect(() => enforceBoundClientOpAllowList(bound, o)).not.toThrow();
+      }
+    });
+
+    test('owner-scoped control-plane ops are not treated as content writes', () => {
+      const degraded = { ...bound, boundSlugPrefixes: undefined, fenceProjectionDegraded: true };
+      for (const name of OWNER_SCOPED_CONTROL_OPS) {
+        const o = operations.find(x => x.name === name);
+        if (!o) throw new Error(`${name} missing from operations`);
+        expect(() => enforceBoundClientOpAllowList(bound, o)).not.toThrow();
+        expect(() => enforceBoundClientOpAllowList(degraded, o)).not.toThrow();
       }
     });
 

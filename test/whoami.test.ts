@@ -77,7 +77,37 @@ describe('whoami op contract', () => {
       expires_at: 1234567890,
       source_id: 'hot-memory',
       federated_read: ['hot-memory', 'canonical-brain'],
+      control_plane_capabilities: [],
+      bound_inherited_agent_tools: [],
+      bound_source_id: null,
+      bound_slug_prefixes: [],
+      max_concurrent_inflight_jobs: 1,
+      daily_budget_usd: null,
+      provider_allowlist: [],
+      model_allowlist: [],
     });
+  });
+
+  test('oauth transport reports non-secret governed bindings', async () => {
+    const engine = {
+      executeRaw: async () => [{
+        control_capabilities: ['submit_agent', 'get_owned_job'],
+        bound_tools: ['query'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['projects/'],
+        bound_max_concurrent: 2,
+        budget_usd_per_day: '1.5',
+        allowed_providers: ['openai'],
+        allowed_models: ['openai:gpt-4o-mini'],
+      }],
+    } as any;
+    const result = await whoami.handler(ctxWith({
+      engine,
+      auth: { token: 'redacted', clientId: 'gbrain_cl_governed', scopes: ['agent'] },
+    }), {}) as any;
+    expect(result.control_plane_capabilities).toEqual(['submit_agent', 'get_owned_job']);
+    expect(result.bound_inherited_agent_tools).toEqual(['query']);
+    expect(result).not.toHaveProperty('token');
   });
 
   test('oauth transport uses fail-closed empty values when source grants are absent', async () => {
@@ -217,5 +247,23 @@ describe('whoami op metadata', () => {
 
   test('mutating is false', () => {
     expect(whoami.mutating).toBeFalsy();
+  });
+});
+
+describe('stdio control-plane boundary', () => {
+  test('auth-less stdio cannot call governed agent job operations', async () => {
+    const ctx = ctxWith({ remote: true, transport: 'stdio', auth: undefined });
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ['submit_agent', { prompt: 'nope', model: 'anthropic:claude-sonnet-4-6' }],
+      ['get_owned_job', { id: 1 }],
+      ['list_owned_jobs', {}],
+      ['cancel_owned_job', { id: 1 }],
+      ['message_owned_job', { id: 1, payload: { text: 'nope' } }],
+      ['get_owned_job_events', { id: 1 }],
+    ];
+    for (const [name, params] of calls) {
+      const operation = operations.find(candidate => candidate.name === name)!;
+      await expect(operation.handler(ctx, params)).rejects.toMatchObject({ code: 'permission_denied' });
+    }
   });
 });

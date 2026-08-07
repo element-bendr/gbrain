@@ -11,7 +11,7 @@
  */
 
 import express from 'express';
-import type { Socket } from 'net';
+import { isIP, type Socket } from 'net';
 import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
@@ -56,6 +56,33 @@ import { registerCleanup } from '../core/process-cleanup.ts';
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+export function nonLoopbackBindWarning(bind: string): string | null {
+  const host = bind.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  const loopback = host === 'localhost' || host === '::1' ||
+    (isIP(host) === 4 && host.split('.')[0] === '127');
+  if (loopback) return null;
+  return `[serve-http] SECURITY WARNING: --bind ${bind} exposes authenticated HTTP MCP beyond loopback. ` +
+    'Use a trusted TLS reverse proxy or tunnel before allowing remote clients.';
+}
+
+export function auditOAuthAuthenticationFailures(engine: BrainEngine) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const startedAt = Date.now();
+    res.once('finish', () => {
+      if (res.statusCode !== 401 || (req as Request & { auth?: AuthInfo }).auth) return;
+      void executeRawJsonb(
+        engine,
+        `INSERT INTO mcp_request_log
+           (token_name, agent_name, operation, latency_ms, status, error_message, params)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [null, null, 'mcp:authenticate', Math.max(0, Date.now() - startedAt), 'auth_failed', 'missing_or_invalid_oauth_bearer'],
+        [null],
+      ).catch(() => { /* authentication refusal must not depend on audit availability */ });
+    });
+    next();
+  };
+}
 
 /**
  * The narrowest contract this module actually consumes: subscribe, unsubscribe.
@@ -617,6 +644,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // than silently binding loopback only.
   const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
+
+  const bindWarning = nonLoopbackBindWarning(bind);
+  if (bindWarning) console.error(`\n${bindWarning}\n`);
 
   if (logFullParams) {
     console.error(
@@ -1684,16 +1714,38 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
         return;
       }
-      const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
-      );
-      // Set per-client TTL if specified
-      if (tokenTtl && Number(tokenTtl) > 0) {
-        await sql`UPDATE oauth_clients SET token_ttl = ${Number(tokenTtl)} WHERE client_id = ${result.clientId}`;
+      const body = req.body as Record<string, unknown>;
+      const asStrings = (camel: string, snake: string): string[] | undefined => {
+        const value = body[camel] ?? body[snake];
+        return Array.isArray(value) ? value.map(String) : undefined;
+      };
+      const agentBindings = {
+        controlCapabilities: asStrings('controlCapabilities', 'control_capabilities') ?? [],
+        boundTools: asStrings('boundTools', 'bound_tools'),
+        boundSourceId: String(body.boundSourceId ?? body.bound_source_id ?? body.sourceId ?? 'default'),
+        boundBrainId: body.boundBrainId || body.bound_brain_id ? String(body.boundBrainId ?? body.bound_brain_id) : undefined,
+        boundSlugPrefixes: asStrings('boundSlugPrefixes', 'bound_slug_prefixes'),
+        boundMaxConcurrent: body.boundMaxConcurrent === undefined && body.bound_max_concurrent === undefined
+          ? undefined : Number(body.boundMaxConcurrent ?? body.bound_max_concurrent),
+        budgetUsdPerDay: body.budgetUsdPerDay === undefined && body.budget_usd_per_day === undefined
+          ? undefined : String(body.budgetUsdPerDay ?? body.budget_usd_per_day),
+        allowedProviders: asStrings('allowedProviders', 'allowed_providers'),
+        allowedModels: asStrings('allowedModels', 'allowed_models'),
+      };
+      const ttl = tokenTtl === undefined || tokenTtl === null ? undefined : Number(tokenTtl);
+      if (ttl !== undefined && (!Number.isInteger(ttl) || ttl <= 0)) {
+        res.status(400).json({ error: 'invalid_token_ttl' }); return;
       }
+      const result = await oauthProvider.registerClientManual(
+        name, grants, scopeString, uris, agentBindings.boundSourceId, undefined,
+        validatedAuthMethod, agentBindings, ttl,
+      );
       res.json({ ...result, tokenTtl: tokenTtl ? Number(tokenTtl) : null });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Registration failed' });
+      res.status(400).json({
+        error: 'invalid_client_registration',
+        message: e instanceof Error ? e.message : 'Registration failed',
+      });
     }
   });
 
@@ -1852,7 +1904,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post(
+    '/mcp',
+    auditOAuthAuthenticationFailures(engine),
+    requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }),
+    async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -2136,7 +2192,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
       }
     }
-  });
+    },
+  );
 
   // ---------------------------------------------------------------------------
   // v0.38 ingestion substrate — POST /ingest (webhook source)

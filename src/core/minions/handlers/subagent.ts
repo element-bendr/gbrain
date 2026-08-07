@@ -50,9 +50,17 @@ import {
 import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop } from '../../ai/gateway.ts';
-import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
+import { toolLoop as gatewayToolLoop, withGatewaySpendContext } from '../../ai/gateway.ts';
+import type {
+  ChatToolDef,
+  ChatMessage,
+  ChatBlock,
+  ChatResult,
+  ToolHandler,
+  GatewaySpendContext,
+} from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
+import { isModelExplicitlyConfigured, resolveRecipe } from '../../ai/model-resolver.ts';
 import { randomUUIDv7 } from 'bun';
 
 // ── Defaults ────────────────────────────────────────────────
@@ -252,11 +260,12 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // route ALL subagent jobs through gateway.toolLoop() (works for every
     // provider in src/core/ai/recipes/). When OFF, route through the legacy
     // Anthropic-direct path AND refuse non-Anthropic models loudly.
+    const governedSpendContext = await loadGovernedGatewaySpendContext(engine, ctx.id, model, config);
     const useGatewayLoopRaw = await engine.getConfig('agent.use_gateway_loop').catch(() => null);
     // #2753: share the doctor's truthiness set. Before this, the doctor accepted
     // yes/on but the worker did not, so `config set ... yes` reported healthy
     // here and still refused the job below.
-    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw);
+    const useGatewayLoop = governedSpendContext !== null || isConfigTruthy(useGatewayLoopRaw);
     if (!useGatewayLoop && !isAnthropicProvider(model)) {
       throw new Error(
         `subagent job: resolved model "${model}" is non-Anthropic but agent.use_gateway_loop is not enabled. ` +
@@ -312,6 +321,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         toolDefs,
         maxTurns,
         maxOutputTokens,
+        spendContext: governedSpendContext ?? undefined,
       });
     }
 
@@ -834,6 +844,54 @@ interface GatewayRunArgs {
   maxTurns: number;
   /** #2778: per-turn output-token cap (resolved by resolveMaxOutputTokens). */
   maxOutputTokens: number;
+  spendContext?: GatewaySpendContext;
+}
+
+async function loadGovernedGatewaySpendContext(
+  engine: BrainEngine,
+  jobId: number,
+  model: string,
+  config: GBrainConfig,
+): Promise<GatewaySpendContext | null> {
+  const rows = await engine.executeRaw<Record<string, unknown>>(
+    `SELECT j.owner_client_id, j.requested_job_budget_cents, j.correlation_id,
+            c.budget_usd_per_day::text AS daily_budget_usd
+       FROM minion_jobs j
+       LEFT JOIN oauth_clients c ON c.client_id = j.owner_client_id AND c.deleted_at IS NULL
+      WHERE j.id = $1`,
+    [jobId],
+  );
+  const ownerClientId = rows[0]?.owner_client_id;
+  if (typeof ownerClientId !== 'string' || ownerClientId.length === 0) return null;
+  const dailyBudgetUsd = rows[0]?.daily_budget_usd;
+  if (dailyBudgetUsd === null || dailyBudgetUsd === undefined) {
+    throw new Error(`governed job ${jobId} has no registered daily budget; provider call refused`);
+  }
+  const dailyCapCents = Math.round(Number(dailyBudgetUsd) * 100);
+  const jobCapRaw = rows[0]?.requested_job_budget_cents;
+  const jobCapCents = jobCapRaw === null || jobCapRaw === undefined ? undefined : Number(jobCapRaw);
+  if (!Number.isSafeInteger(dailyCapCents) || dailyCapCents < 0 ||
+      (jobCapCents !== undefined && (!Number.isSafeInteger(jobCapCents) || jobCapCents < 0))) {
+    throw new Error(`governed job ${jobId} has invalid budget metadata; provider call refused`);
+  }
+  const dbChatModel = config.chat_model === undefined
+    ? await engine.getConfig('chat_model').catch(() => null)
+    : null;
+  const configuredModels = [config.chat_model ?? dbChatModel, ...(config.chat_fallback_chain ?? [])];
+  const providerId = (() => {
+    try { return resolveRecipe(model).parsed.providerId; } catch { return null; }
+  })();
+  return {
+    engine,
+    clientId: ownerClientId,
+    jobId,
+    dailyCapCents,
+    jobCapCents,
+    correlationId: typeof rows[0]?.correlation_id === 'string'
+      ? rows[0].correlation_id
+      : `job:${jobId}`,
+    allowZeroPrice: providerId === 'ollama' && isModelExplicitlyConfigured(model, configuredModels),
+  };
 }
 
 /**
@@ -851,7 +909,7 @@ interface GatewayRunArgs {
  * reconciler sees both shapes uniformly.
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
-  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens } = args;
+  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, spendContext } = args;
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.
@@ -968,7 +1026,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   };
 
   // Run the loop.
-  const result = await gatewayToolLoop({
+  const runLoop = () => gatewayToolLoop({
     model,
     system: systemPrompt,
     initialMessages,
@@ -1071,6 +1129,9 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     },
     onHeartbeat: heartbeat,
   });
+  const result = await (spendContext
+    ? withGatewaySpendContext(spendContext, runLoop)
+    : runLoop());
 
   // Map gateway stop reason to SubagentStopReason. SubagentStopReason has
   // {end_turn, max_turns, refusal, error}; aborted maps to error.

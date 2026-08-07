@@ -352,6 +352,9 @@ interface RegisterClientArgs {
   boundSlugPrefixes: string[] | undefined;
   boundMaxConcurrent: number | undefined;
   budgetUsdPerDay: string | undefined;
+  controlCapabilities: string[] | undefined;
+  allowedProviders: string[] | undefined;
+  allowedModels: string[] | undefined;
 }
 
 export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
@@ -368,6 +371,9 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
     boundSlugPrefixes: undefined,
     boundMaxConcurrent: undefined,
     budgetUsdPerDay: undefined,
+    controlCapabilities: undefined,
+    allowedProviders: undefined,
+    allowedModels: undefined,
   };
   let i = 0;
   let grantTypesSet = false;
@@ -404,6 +410,18 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
       case '--bound-tools': {
         const v = requireValue();
         out.boundTools = v.split(',').map(s => s.trim()).filter(Boolean);
+        i += 2; break;
+      }
+      case '--control-capabilities': {
+        out.controlCapabilities = requireValue().split(',').map(s => s.trim()).filter(Boolean);
+        i += 2; break;
+      }
+      case '--allowed-providers': {
+        out.allowedProviders = requireValue().split(',').map(s => s.trim()).filter(Boolean);
+        i += 2; break;
+      }
+      case '--allowed-models': {
+        out.allowedModels = requireValue().split(',').map(s => s.trim()).filter(Boolean);
         i += 2; break;
       }
       case '--bound-source': out.boundSourceId = requireValue(); i += 2; break;
@@ -458,7 +476,8 @@ async function registerClient(name: string, args: string[]) {
   }
   const { grantTypes, scopes, sourceId, federatedRead, redirectUris, tokenEndpointAuthMethod } = parsed;
   const agentBindings = parsed.boundTools || parsed.boundSourceId || parsed.boundBrainId ||
-    parsed.boundSlugPrefixes || parsed.boundMaxConcurrent !== undefined || parsed.budgetUsdPerDay !== undefined
+    parsed.boundSlugPrefixes || parsed.boundMaxConcurrent !== undefined || parsed.budgetUsdPerDay !== undefined ||
+    parsed.controlCapabilities || parsed.allowedProviders || parsed.allowedModels
     ? {
       boundTools: parsed.boundTools,
       boundSourceId: parsed.boundSourceId,
@@ -466,6 +485,9 @@ async function registerClient(name: string, args: string[]) {
       boundSlugPrefixes: parsed.boundSlugPrefixes,
       boundMaxConcurrent: parsed.boundMaxConcurrent,
       budgetUsdPerDay: parsed.budgetUsdPerDay,
+      controlCapabilities: parsed.controlCapabilities,
+      allowedProviders: parsed.allowedProviders,
+      allowedModels: parsed.allowedModels,
     }
     : undefined;
 
@@ -500,6 +522,9 @@ async function registerClient(name: string, args: string[]) {
         console.log(`  Bound slug prefixes:${parsed.boundSlugPrefixes ? ' ' + parsed.boundSlugPrefixes.join(', ') : ' <none>'}`);
         console.log(`  Max concurrency:     ${parsed.boundMaxConcurrent ?? 1}`);
         console.log(`  Daily budget USD:    ${parsed.budgetUsdPerDay ?? '<none>'}`);
+        console.log(`  Control capabilities:${parsed.controlCapabilities ? ' ' + parsed.controlCapabilities.join(', ') : ' <none>'}`);
+        console.log(`  Allowed providers:   ${(parsed.allowedProviders ?? []).join(', ') || '<none>'}`);
+        console.log(`  Allowed models:      ${(parsed.allowedModels ?? []).join(', ') || '<none>'}`);
       }
       console.log('');
       if (clientSecret) {
@@ -654,6 +679,9 @@ Usage:
      --token-endpoint-auth-method <method>                 (v0.41.3+; client_secret_post | client_secret_basic | none;
                                                             'none' = public PKCE-only client, no secret minted)
      --bound-tools <tool1,tool2>                           Bind submit_agent to an allow-list of tools
+     --control-capabilities <cap1,cap2>                    OAuth control-plane operations (not inherited tools)
+     --allowed-providers <provider1,provider2>             Agent provider allowlist
+     --allowed-models <provider:model,...>                 Agent model allowlist
      --bound-source <id>                                   Bind submit_agent jobs to a source id
      --bound-brain <id>                                    Bind submit_agent jobs to a brain id
      --bound-slug-prefixes <prefix1,prefix2>               Fence ALL direct slug writes (put_page, delete_page,

@@ -60,9 +60,12 @@ describe('chat touchpoint — recipe registry', () => {
     }
   });
 
-  test('embedding-only providers (voyage, ollama) do NOT declare chat', () => {
+  test('voyage stays embedding-only while approved Ollama Gemma models support local agent chat', () => {
     expect(getRecipe('voyage')!.touchpoints.chat).toBeUndefined();
-    expect(getRecipe('ollama')!.touchpoints.chat).toBeUndefined();
+    const ollamaChat = getRecipe('ollama')!.touchpoints.chat;
+    expect(ollamaChat?.models).toEqual(['gemma4:e2b']);
+    expect(ollamaChat?.supports_tools).toBe(true);
+    expect(ollamaChat?.supports_subagent_loop).toBe(true);
   });
 
   test('openai-compat chat recipes have base_url_default', () => {
@@ -164,6 +167,7 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
     expect(() => assertTouchpoint(getRecipe('openai')!, 'chat', 'gpt-5.2')).not.toThrow();
     expect(() => assertTouchpoint(getRecipe('google')!, 'chat', 'gemini-2.0-flash')).not.toThrow();
     expect(() => assertTouchpoint(getRecipe('deepseek')!, 'chat', 'deepseek-v4-flash')).not.toThrow();
+    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'gemma4:e2b')).not.toThrow();
     // Legacy id retired by DeepSeek 2026-07-24 (#1255): still passes local
     // validation (openai-compat tier), rejection surfaces at the provider.
     expect(() => assertTouchpoint(getRecipe('deepseek')!, 'chat', 'deepseek-chat')).not.toThrow();
@@ -171,8 +175,6 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
 
   test('assertTouchpoint rejects chat on embedding-only providers with a fix hint', () => {
     expect(() => assertTouchpoint(getRecipe('voyage')!, 'chat', 'voyage-3'))
-      .toThrow(AIConfigError);
-    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'nomic-embed-text'))
       .toThrow(AIConfigError);
   });
 

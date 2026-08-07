@@ -1286,6 +1286,11 @@ async function handleCliOnly(command: string, args: string[]) {
     await runSchema(args);
     return;
   }
+  if (command === 'jobs' && args[0] === 'service') {
+    const { runJobsService } = await import('./commands/jobs-service.ts');
+    runJobsService(args.slice(1));
+    return;
+  }
   if (command === 'init') {
     const { runInit } = await import('./commands/init.ts');
     await runInit(args);

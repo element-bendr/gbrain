@@ -153,6 +153,55 @@ a `supervisor` check in its health report.
 
 For long-running Linux VMs with shell access.
 
+### User-level service (recommended)
+
+The built-in installer needs no root and refuses non-Postgres configurations.
+It resolves the current `gbrain` executable to an absolute path, writes no
+secrets into the unit, creates the environment file with mode `0600`, and
+starts the existing two-layer worker supervisor:
+
+```bash
+gbrain jobs service install
+
+# The installer prints both paths. Defaults:
+#   ~/.config/systemd/user/gbrain-worker.service
+#   ~/.config/gbrain/worker.env
+# Add only credentials that are not already in ~/.gbrain/config.json, then:
+systemctl --user restart gbrain-worker.service
+```
+
+The environment file is never overwritten by a reinstall and is deliberately
+preserved by uninstall. The unit uses `Restart=on-failure` with a bounded 10s
+delay. `SIGTERM` gets a 45s stop window, covering the supervisor's 35s worker
+drain before systemd escalates. Worker leases remain in PostgreSQL; after a
+crash, expired leases are reclaimed by the existing stalled-job sweep.
+
+Verified operational commands:
+
+```bash
+systemctl --user enable gbrain-worker.service
+systemctl --user start gbrain-worker.service
+systemctl --user stop gbrain-worker.service
+systemctl --user restart gbrain-worker.service
+systemctl --user status gbrain-worker.service
+journalctl --user -u gbrain-worker.service -n 100 --no-pager
+gbrain jobs supervisor status --json
+systemctl --user disable gbrain-worker.service
+gbrain jobs service uninstall
+```
+
+Installation and rollback are idempotent. `gbrain jobs service uninstall`
+stops and disables the unit before removing it, reloads the user manager, and
+leaves `~/.config/gbrain/worker.env` in place so credentials are not destroyed.
+Delete that file separately only when credential removal is intended. For a
+service that must run while the user is logged out, an operator may additionally
+enable user lingering (`loginctl enable-linger "$USER"`); this is host policy,
+not part of the installer.
+
+The user unit is the production path for a single-user installation. The
+system-level example below remains available for hosts that intentionally use
+a dedicated service account and administrator-managed `/etc` configuration.
+
 ```bash
 # Create the worker user if it doesn't exist.
 sudo useradd --system --home "$GBRAIN_WORKSPACE" --shell /usr/sbin/nologin gbrain \

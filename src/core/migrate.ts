@@ -5618,6 +5618,154 @@ export const MIGRATIONS: Migration[] = [
         ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
     `,
   },
+  {
+    version: 126,
+    name: 'governed_agent_client_bindings',
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS control_capabilities TEXT[] NOT NULL DEFAULT '{}';
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS allowed_providers TEXT[] NOT NULL DEFAULT '{}';
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS allowed_models TEXT[] NOT NULL DEFAULT '{}';
+
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_bound_max_concurrent_valid;
+      ALTER TABLE oauth_clients ADD CONSTRAINT oauth_clients_bound_max_concurrent_valid
+        CHECK (bound_max_concurrent IS NULL OR (bound_max_concurrent >= 1 AND bound_max_concurrent <= 1000));
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_budget_nonnegative;
+      ALTER TABLE oauth_clients ADD CONSTRAINT oauth_clients_budget_nonnegative
+        CHECK (budget_usd_per_day IS NULL OR budget_usd_per_day >= 0);
+
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_control_capabilities
+        ON oauth_clients USING GIN (control_capabilities);
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_allowed_models
+        ON oauth_clients USING GIN (allowed_models);
+
+      CREATE OR REPLACE FUNCTION audit_oauth_client_registration() RETURNS trigger
+      SET search_path = pg_catalog, public AS $fn$
+      BEGIN
+        INSERT INTO mcp_request_log (token_name, operation, status, params)
+        VALUES (NEW.client_name, 'oauth_client_registered', 'success', jsonb_build_object(
+          'client_id', NEW.client_id,
+          'scope', NEW.scope,
+          'control_capabilities', NEW.control_capabilities,
+          'bound_tools', NEW.bound_tools,
+          'bound_source_id', NEW.bound_source_id,
+          'bound_slug_prefixes', NEW.bound_slug_prefixes,
+          'bound_max_concurrent', NEW.bound_max_concurrent,
+          'budget_usd_per_day', NEW.budget_usd_per_day,
+          'allowed_providers', NEW.allowed_providers,
+          'allowed_models', NEW.allowed_models
+        ));
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS trg_audit_oauth_client_registration ON oauth_clients;
+      CREATE TRIGGER trg_audit_oauth_client_registration
+        AFTER INSERT ON oauth_clients FOR EACH ROW EXECUTE FUNCTION audit_oauth_client_registration();
+    `,
+  },
+  {
+    version: 127,
+    name: 'governed_agent_job_ownership_and_events',
+    idempotent: true,
+    sql: `
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS owner_client_id TEXT;
+      UPDATE minion_jobs
+         SET owner_client_id = data->>'__owner_client_id'
+       WHERE owner_client_id IS NULL AND data ? '__owner_client_id';
+
+      CREATE INDEX IF NOT EXISTS idx_minion_jobs_owner_status
+        ON minion_jobs(owner_client_id, status, id DESC) WHERE owner_client_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS minion_job_events (
+        id BIGSERIAL PRIMARY KEY,
+        job_id INTEGER NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+        owner_client_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (length(event_type) BETWEEN 1 AND 64),
+        correlation_id TEXT,
+        payload JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT minion_job_events_correlation_bounded
+          CHECK (correlation_id IS NULL OR length(correlation_id) <= 64)
+      );
+      CREATE INDEX IF NOT EXISTS idx_minion_job_events_owner_cursor
+        ON minion_job_events(owner_client_id, job_id, id);
+    `,
+  },
+  {
+    version: 128,
+    name: 'governed_agent_atomic_admission',
+    idempotent: true,
+    sql: `
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS owner_idempotency_key TEXT;
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS request_fingerprint CHAR(64);
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS requested_model TEXT;
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS effective_model TEXT;
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS requested_job_budget_cents BIGINT;
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS causation_id TEXT;
+
+      ALTER TABLE minion_jobs DROP CONSTRAINT IF EXISTS minion_jobs_owner_idempotency_bounded;
+      ALTER TABLE minion_jobs ADD CONSTRAINT minion_jobs_owner_idempotency_bounded
+        CHECK (owner_idempotency_key IS NULL OR length(owner_idempotency_key) BETWEEN 1 AND 128);
+      ALTER TABLE minion_jobs DROP CONSTRAINT IF EXISTS minion_jobs_trace_ids_bounded;
+      ALTER TABLE minion_jobs ADD CONSTRAINT minion_jobs_trace_ids_bounded
+        CHECK ((correlation_id IS NULL OR length(correlation_id) <= 64)
+           AND (causation_id IS NULL OR length(causation_id) <= 64));
+      ALTER TABLE minion_jobs DROP CONSTRAINT IF EXISTS minion_jobs_job_budget_nonnegative;
+      ALTER TABLE minion_jobs ADD CONSTRAINT minion_jobs_job_budget_nonnegative
+        CHECK (requested_job_budget_cents IS NULL OR requested_job_budget_cents >= 0);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_minion_jobs_owner_idempotency
+        ON minion_jobs(owner_client_id, owner_idempotency_key)
+        WHERE owner_client_id IS NOT NULL AND owner_idempotency_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_minion_jobs_owner_inflight
+        ON minion_jobs(owner_client_id, status)
+        WHERE owner_client_id IS NOT NULL
+          AND status IN ('waiting','active','waiting-children','delayed','paused');
+    `,
+  },
+  {
+    version: 129,
+    name: 'governed_agent_gateway_budget_accounting',
+    idempotent: true,
+    sql: `
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS estimated_input_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS max_output_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS actual_input_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS actual_output_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS actual_cache_read_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS actual_cache_creation_tokens INTEGER;
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS pricing_source TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE mcp_spend_reservations ADD COLUMN IF NOT EXISTS pricing_version TEXT NOT NULL DEFAULT 'legacy';
+
+      ALTER TABLE mcp_spend_reservations DROP CONSTRAINT IF EXISTS mcp_spend_reservations_status_check;
+      ALTER TABLE mcp_spend_reservations ADD CONSTRAINT mcp_spend_reservations_status_check
+        CHECK (status IN ('pending', 'settled', 'expired', 'released'));
+      ALTER TABLE mcp_spend_reservations DROP CONSTRAINT IF EXISTS mcp_spend_reservations_attempt_positive;
+      ALTER TABLE mcp_spend_reservations ADD CONSTRAINT mcp_spend_reservations_attempt_positive
+        CHECK (attempt > 0);
+      ALTER TABLE mcp_spend_reservations DROP CONSTRAINT IF EXISTS mcp_spend_reservations_trace_bounded;
+      ALTER TABLE mcp_spend_reservations ADD CONSTRAINT mcp_spend_reservations_trace_bounded
+        CHECK (correlation_id IS NULL OR correlation_id ~ '^[A-Za-z0-9._:-]{1,64}$');
+      ALTER TABLE mcp_spend_reservations DROP CONSTRAINT IF EXISTS mcp_spend_reservations_usage_nonnegative;
+      ALTER TABLE mcp_spend_reservations ADD CONSTRAINT mcp_spend_reservations_usage_nonnegative CHECK (
+        (estimated_input_tokens IS NULL OR estimated_input_tokens >= 0) AND
+        (max_output_tokens IS NULL OR max_output_tokens >= 0) AND
+        (actual_input_tokens IS NULL OR actual_input_tokens >= 0) AND
+        (actual_output_tokens IS NULL OR actual_output_tokens >= 0) AND
+        (actual_cache_read_tokens IS NULL OR actual_cache_read_tokens >= 0) AND
+        (actual_cache_creation_tokens IS NULL OR actual_cache_creation_tokens >= 0)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_job_attempt
+        ON mcp_spend_reservations(job_id, attempt) WHERE job_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_unsettled
+        ON mcp_spend_reservations(client_id, job_id, expires_at)
+        WHERE status = 'pending';
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

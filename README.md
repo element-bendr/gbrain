@@ -446,6 +446,7 @@ completes in ~1-2 seconds. (Closes #1605, #1581.)
 - [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
 - [`docs/guides/`](docs/guides/) — how-to runbooks (sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
+- [`docs/guides/governed-agent-jobs.md`](docs/guides/governed-agent-jobs.md) — branch runbook for OAuth-bound agent admission, budgets, owned controls, installation, and rollback
 - [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
 - [`docs/mcp/`](docs/mcp/) — per-client MCP setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
 - [`docs/eval/`](docs/eval/) — eval framework, metric glossary, methodology

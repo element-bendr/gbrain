@@ -968,6 +968,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // subagent handler's error message tells users to `config set` this, so it
   // must be a known key or `config set` rejects it without --force.
   'agent.use_gateway_loop',
+  // Optional comma-separated operator allowlist for governed agent providers.
+  'agent.enabled_providers',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
   // DB-plane (v0.32.3 search modes + related)

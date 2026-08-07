@@ -33,6 +33,24 @@ export interface TrustedSubmitOpts {
   /** When true, allow submission of names in PROTECTED_JOB_NAMES (currently 'shell').
    *  Set only by the CLI path and by `submit_job` when `ctx.remote === false`. */
   allowProtectedSubmit?: boolean;
+  agentAdmission?: {
+    ownerClientId: string;
+    maxConcurrent: number;
+    idempotencyKey?: string;
+    requestFingerprint: string;
+    correlationId: string;
+    causationId?: string;
+    requestedModel?: string;
+    effectiveModel?: string;
+    requestedJobBudgetCents?: number;
+  };
+}
+
+export class MinionAdmissionError extends Error {
+  constructor(readonly code: 'agent_concurrency_limit' | 'idempotency_conflict', message: string) {
+    super(message);
+    this.name = 'MinionAdmissionError';
+  }
 }
 
 const MIGRATION_VERSION = 7;
@@ -130,6 +148,40 @@ export class MinionQueue {
     const maxSpawnDepth = opts?.max_spawn_depth ?? this.maxSpawnDepth;
 
     return this.engine.transaction(async (tx) => {
+      const admission = trusted?.agentAdmission;
+      if (admission) {
+        await tx.executeRaw(
+          `SELECT pg_advisory_xact_lock(hashtext('agent_admission:' || $1))`,
+          [admission.ownerClientId],
+        );
+        if (admission.idempotencyKey) {
+          const existing = await tx.executeRaw<Record<string, unknown>>(
+            `SELECT * FROM minion_jobs
+              WHERE owner_client_id = $1 AND owner_idempotency_key = $2`,
+            [admission.ownerClientId, admission.idempotencyKey],
+          );
+          if (existing.length > 0) {
+            if (existing[0].request_fingerprint !== admission.requestFingerprint) {
+              throw new MinionAdmissionError('idempotency_conflict', 'Idempotency key was already accepted with a different request fingerprint.');
+            }
+            return rowToMinionJob(existing[0]);
+          }
+        }
+        const count = await tx.executeRaw<{ count: string }>(
+          `SELECT count(*)::text AS count FROM minion_jobs
+            WHERE owner_client_id = $1
+              AND status IN ('waiting','active','waiting-children','delayed','paused')`,
+          [admission.ownerClientId],
+        );
+        const inflight = Number(count[0]?.count ?? 0);
+        if (inflight >= admission.maxConcurrent) {
+          throw new MinionAdmissionError(
+            'agent_concurrency_limit',
+            `Agent concurrency limit reached (${inflight}/${admission.maxConcurrent}).`,
+          );
+        }
+      }
+
       // 1. Idempotency fast path — if a row already exists for this key, return it
       //    without doing any other work. The unique partial index guarantees
       //    no second row can be inserted with the same non-null key.
@@ -279,17 +331,8 @@ export class MinionQueue {
             depth, max_children, timeout_ms, remove_on_complete, remove_on_fail, idempotency_key,
             quiet_hours, stagger_key`;
       const baseVals = `$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20`;
-      const cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
-      const vals = hasMaxStalled ? `${baseVals}, $21` : baseVals;
-
-      const insertSql = opts?.idempotency_key
-        ? `INSERT INTO minion_jobs (${cols})
-           VALUES (${vals})
-           ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-           RETURNING *`
-        : `INSERT INTO minion_jobs (${cols})
-           VALUES (${vals})
-           RETURNING *`;
+      let cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
+      let vals = hasMaxStalled ? `${baseVals}, $21` : baseVals;
 
       const params: unknown[] = [
         jobName,
@@ -306,9 +349,6 @@ export class MinionQueue {
         opts?.on_child_fail ?? 'fail_parent',
         depth,
         opts?.max_children ?? null,
-        // #1737: long handlers (subagent, embed-backfill, autopilot-cycle) get a
-        // sane long wall-clock default stamped at submit when the caller didn't
-        // pass one, so they aren't killed mid-progress by the short null-default.
         opts?.timeout_ms ?? defaultTimeoutMsFor(jobName),
         opts?.remove_on_complete ?? false,
         opts?.remove_on_fail ?? false,
@@ -317,11 +357,48 @@ export class MinionQueue {
         opts?.stagger_key ?? null,
       ];
       if (hasMaxStalled) params.push(clampedMaxStalled);
+      if (admission) {
+        const start = params.length + 1;
+        cols += `, owner_client_id, owner_idempotency_key, request_fingerprint,
+          requested_model, effective_model, requested_job_budget_cents, correlation_id, causation_id`;
+        vals += `, $${start}, $${start + 1}, $${start + 2}, $${start + 3},
+          $${start + 4}, $${start + 5}, $${start + 6}, $${start + 7}`;
+        params.push(
+          admission.ownerClientId, admission.idempotencyKey ?? null, admission.requestFingerprint,
+          admission.requestedModel ?? null, admission.effectiveModel ?? null,
+          admission.requestedJobBudgetCents ?? null, admission.correlationId,
+          admission.causationId ?? null,
+        );
+      }
+
+      const insertSql = admission?.idempotencyKey
+        ? `INSERT INTO minion_jobs (${cols}) VALUES (${vals})
+           ON CONFLICT (owner_client_id, owner_idempotency_key)
+           WHERE owner_client_id IS NOT NULL AND owner_idempotency_key IS NOT NULL DO NOTHING
+           RETURNING *`
+        : opts?.idempotency_key
+        ? `INSERT INTO minion_jobs (${cols})
+           VALUES (${vals})
+           ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+           RETURNING *`
+        : `INSERT INTO minion_jobs (${cols})
+           VALUES (${vals})
+           RETURNING *`;
 
       const inserted = await tx.executeRaw<Record<string, unknown>>(insertSql, params);
 
       // ON CONFLICT DO NOTHING returns 0 rows — fall back to SELECT to fetch the
       // existing row that won the race.
+      if (inserted.length === 0 && admission?.idempotencyKey) {
+        const existing = await tx.executeRaw<Record<string, unknown>>(
+          `SELECT * FROM minion_jobs WHERE owner_client_id = $1 AND owner_idempotency_key = $2`,
+          [admission.ownerClientId, admission.idempotencyKey],
+        );
+        if (existing.length === 0 || existing[0].request_fingerprint !== admission.requestFingerprint) {
+          throw new MinionAdmissionError('idempotency_conflict', 'Conflicting concurrent idempotent submission.');
+        }
+        return rowToMinionJob(existing[0]);
+      }
       if (inserted.length === 0 && opts?.idempotency_key) {
         const existing = await tx.executeRaw<Record<string, unknown>>(
           `SELECT * FROM minion_jobs WHERE idempotency_key = $1`,
@@ -334,6 +411,14 @@ export class MinionQueue {
       }
 
       const child = rowToMinionJob(inserted[0]);
+
+      if (admission) {
+        await tx.executeRaw(
+          `INSERT INTO minion_job_events(job_id, owner_client_id, event_type, correlation_id, payload)
+           VALUES ($1, $2, 'accepted', $3, '{}'::jsonb)`,
+          [child.id, admission.ownerClientId, admission.correlationId],
+        );
+      }
 
       // 4. Flip parent to waiting-children if this is a fresh child insert.
       //    Only transition from non-terminal, non-already-waiting-children states.
