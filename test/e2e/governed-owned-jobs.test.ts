@@ -69,9 +69,19 @@ describePG('governed owner-scoped job control on PostgreSQL', () => {
     const second = await op('cancel_owned_job').handler(alice, { id }) as any;
     expect(second.already_cancelled).toBe(true);
 
-    const events = await op('get_owned_job_events').handler(alice, { id, cursor: 0, limit: 500 }) as any;
-    expect(events.limit).toBe(100);
+    const events = await op('get_owned_job_events').handler(alice, { id, cursor: 0, limit: 1 }) as any;
+    expect(events.limit).toBe(1);
     expect(events.events.map((event: any) => event.event_type)).toEqual(['cancelled']);
+    expect(events.events[0].id).toBe(events.next_cursor);
+    expect(() => JSON.stringify(events)).not.toThrow();
+    expect((await op('get_owned_job_events').handler(alice, {
+      id, cursor: events.next_cursor, limit: 1,
+    }) as any).events).toEqual([]);
+    await getConn()`INSERT INTO minion_job_events(id, job_id, owner_client_id, event_type)
+      VALUES (${'9007199254740992'}, ${id}, 'gbrain_cl_alice', 'unsafe_cursor')`;
+    await expect(op('get_owned_job_events').handler(alice, {
+      id, cursor: events.next_cursor,
+    })).rejects.toThrow(/safe-integer cursor range/);
     await expect(op('message_owned_job').handler(alice, { id, payload: { text: 'late' } })).rejects.toThrow(/terminal/);
     const completedId = await seed('gbrain_cl_alice', 'completed');
     await expect(op('message_owned_job').handler(alice, { id: completedId, payload: { text: 'late' } })).rejects.toThrow(/terminal/);

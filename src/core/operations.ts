@@ -3887,8 +3887,15 @@ const get_owned_job_events: Operation = {
         ORDER BY id ASC LIMIT $4`,
       [clientId, id, cursor, limit],
     );
-    const nextCursor = events.length === 0 ? cursor : Number(events[events.length - 1].id);
-    return { job_id: id, cursor, limit, events, next_cursor: nextCursor };
+    const normalizedEvents = events.map(event => {
+      const eventId = Number(event.id);
+      if (!Number.isSafeInteger(eventId) || eventId < 1) {
+        throw new OperationError('database_error', 'Event ID exceeds the supported safe-integer cursor range.');
+      }
+      return { ...event, id: eventId };
+    });
+    const nextCursor = normalizedEvents.length === 0 ? cursor : normalizedEvents[normalizedEvents.length - 1].id;
+    return { job_id: id, cursor, limit, events: normalizedEvents, next_cursor: nextCursor };
   },
 };
 
