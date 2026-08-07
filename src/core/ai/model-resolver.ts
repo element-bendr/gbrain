@@ -122,6 +122,9 @@ export function normalizeGovernedModel(modelId: string): Omit<GovernedModelPolic
   if (!chat.supports_tools) {
     throw new AIConfigError(`Provider "${recipe.id}" cannot run the governed agent tool loop.`);
   }
+  if (!chat.supports_subagent_loop) {
+    throw new AIConfigError(`Provider "${recipe.id}" cannot run the governed subagent tool loop.`);
+  }
   return { model: `${parsed.providerId}:${parsed.modelId}`, parsed, recipe };
 }
 

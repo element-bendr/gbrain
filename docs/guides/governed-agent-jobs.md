@@ -114,6 +114,10 @@ The model must satisfy all of these gates:
 4. the OAuth client allows the exact provider and normalized model;
 5. required provider credentials and canonical pricing exist before execution.
 
+`supports_tools` alone is insufficient when a provider declares
+`supports_subagent_loop: false`; governed registration and submission reject
+that provider before execution.
+
 Registration establishes eligibility and may happen before credentials or
 pricing are installed. `submit_agent` independently checks current provider
 enablement, credentials, and pricing before queueing paid work. The worker

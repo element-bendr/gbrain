@@ -182,6 +182,20 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(Number(jobs[0].count)).toBe(0);
     });
 
+    it('rejects a tool-capable provider without governed subagent-loop support', async () => {
+      const model = 'mistral:mistral-small-latest';
+      await seedClient('no-subagent-loop', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['mistral'], allowed_models: [model],
+      });
+      await expect(callSubmitAgent(makeCtx({ clientId: 'no-subagent-loop' }), {
+        prompt: 'go', model,
+      })).rejects.toMatchObject({
+        code: 'model_not_tool_capable',
+        message: expect.stringContaining('governed subagent tool loop'),
+      });
+    });
+
     it('rejects statically unknown and unpriced models before queue insertion', async () => {
       await seedClient('policy', {
         bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],

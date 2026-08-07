@@ -40,8 +40,12 @@ async function validate(
 describe('governed agent client binding validation', () => {
   test('normalizes durable operator approvals deterministically', () => {
     expect(parseGovernedModelList(' openai:gpt-5,openai:gpt-5 ')).toEqual(['openai:gpt-5']);
+    expect(parseGovernedModelList(
+      'anthropic:claude-haiku-4-5,anthropic:claude-haiku-4-5-20251001',
+    )).toEqual(['anthropic:claude-haiku-4-5-20251001']);
     expect(() => parseGovernedModelList('openai:gpt-5,,openai:gpt-4o')).toThrow('1-100');
     expect(() => parseGovernedModelList('OpenAI:gpt-5')).toThrow('bounded provider:model');
+    expect(() => parseGovernedModelList('openai/gpt-5')).toThrow('bounded provider:model');
   });
 
   test('normalizes duplicates deterministically', async () => {
@@ -94,11 +98,24 @@ describe('governed agent client binding validation', () => {
   });
 
   test('operator approval cannot bypass provider tool capability', async () => {
+    await expect(validate({
+      allowedProviders: ['minimax'],
+      allowedModels: ['minimax:MiniMax-M3'],
+    })).rejects.toThrow('tool loop');
+
     const model = 'minimax:gbrain-test-future-model';
     await expect(validate(
       { allowedProviders: ['minimax'], allowedModels: [model] },
       { 'agent.approved_models': model },
     )).rejects.toThrow('tool loop');
+  });
+
+  test('tool support alone cannot bypass governed subagent-loop capability', async () => {
+    const model = 'mistral:mistral-small-latest';
+    await expect(validate({
+      allowedProviders: ['mistral'],
+      allowedModels: [model],
+    })).rejects.toThrow('governed subagent tool loop');
   });
 
   test('revoking operator approval blocks new registrations', async () => {
