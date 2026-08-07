@@ -364,6 +364,12 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
   'submit_agent',
 ]);
 
+/** Owner-scoped control plane; each handler re-authorizes OAuth ownership. */
+export const OWNER_SCOPED_CONTROL_OPS: ReadonlySet<string> = new Set([
+  'get_owned_job', 'list_owned_jobs', 'cancel_owned_job',
+  'message_owned_job', 'get_owned_job_events',
+]);
+
 /**
  * Fail-closed gate for slug-bound clients, applied at dispatch (the single
  * choke point both MCP transports share) so it cannot be forgotten per op.
@@ -378,6 +384,7 @@ export function enforceBoundClientOpAllowList(
   // unfenceable ops stay reachable precisely when the fence is unreadable.
   const degraded = auth?.fenceProjectionDegraded === true;
   if (!degraded && !auth?.boundSlugPrefixes) return;
+  if (OWNER_SCOPED_CONTROL_OPS.has(op.name)) return;
   // Gate on "mutates, or carries any non-read scope" rather than on the two
   // literal scope strings 'write'/'admin': `sources_add` / `sources_remove`
   // carry the bespoke `sources_admin` scope and are `mutating: true`, so a
