@@ -22,6 +22,14 @@ let db: PGlite;
 let sql: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<any>;
 let provider: GBrainOAuthProvider;
 
+async function ensureGovernedBindingColumns(): Promise<void> {
+  await db.exec(`
+    ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS control_capabilities TEXT[] NOT NULL DEFAULT '{}';
+    ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS allowed_providers TEXT[] NOT NULL DEFAULT '{}';
+    ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS allowed_models TEXT[] NOT NULL DEFAULT '{}';
+  `);
+}
+
 beforeAll(async () => {
   db = new PGlite({ extensions: { vector, pg_trgm } });
   await db.exec(PGLITE_SCHEMA_SQL);
@@ -163,6 +171,55 @@ describe('client registration', () => {
     expect(rows[0].bound_slug_prefixes).toEqual(['wiki/agents/bound-agent/']);
     expect(Number(rows[0].bound_max_concurrent)).toBe(2);
     expect(rows[0].budget).toBe('7.50');
+  });
+
+  test('manual governed registration honors durable operator-approved dynamic models', async () => {
+    await ensureGovernedBindingColumns();
+    const model = 'openai:gbrain-test-future-model';
+    await sql`
+      INSERT INTO config (key, value) VALUES (${'agent.approved_models'}, ${model})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    `;
+    const bindings = {
+      controlCapabilities: ['submit_agent'],
+      boundTools: ['search'],
+      boundSourceId: 'default',
+      boundMaxConcurrent: 1,
+      budgetUsdPerDay: '1',
+      allowedProviders: ['openai'],
+      allowedModels: [model],
+    };
+    const { clientId } = await provider.registerClientManual(
+      'dynamic-bound-agent', ['client_credentials'], 'read agent', [], 'default',
+      undefined, undefined, bindings,
+    );
+    const [row] = await sql`SELECT allowed_models FROM oauth_clients WHERE client_id = ${clientId}`;
+    expect(row.allowed_models).toEqual([model]);
+
+    await sql`DELETE FROM config WHERE key = ${'agent.approved_models'}`;
+    await expect(provider.registerClientManual(
+      'dynamic-after-revoke', ['client_credentials'], 'read agent', [], 'default',
+      undefined, undefined, bindings,
+    )).rejects.toThrow('static chat catalog or operator approval');
+  });
+
+  test('dynamic client registration cannot inject governed model bindings', async () => {
+    const dcrProvider = new GBrainOAuthProvider({ sql, allowClientCredentialsDcr: true });
+    const client = await dcrProvider.clientsStore.registerClient!({
+      client_name: 'dcr-no-governed-bindings',
+      redirect_uris: [],
+      grant_types: ['client_credentials'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+      allowed_models: ['openai:gbrain-test-future-model'],
+    } as any);
+    const [row] = await sql`
+      SELECT control_capabilities, allowed_providers, allowed_models
+        FROM oauth_clients WHERE client_id = ${client.client_id}
+    `;
+    expect(row.control_capabilities).toEqual([]);
+    expect(row.allowed_providers).toEqual([]);
+    expect(row.allowed_models).toEqual([]);
   });
 });
 

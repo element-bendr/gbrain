@@ -99,6 +99,58 @@ export function isModelExplicitlyConfigured(
   });
 }
 
+const GOVERNED_MODEL_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/;
+
+export interface GovernedModelPolicy {
+  model: string;
+  parsed: ParsedModelId;
+  recipe: Recipe;
+  operatorApproved: boolean;
+  staticCatalog: boolean;
+}
+
+/** Validate the provider-level requirements shared by governed registration and submission. */
+export function normalizeGovernedModel(modelId: string): Omit<GovernedModelPolicy, 'operatorApproved' | 'staticCatalog'> {
+  if (!GOVERNED_MODEL_ID_RE.test(modelId)) {
+    throw new AIConfigError(`Model "${modelId}" must use a bounded provider:model identifier.`);
+  }
+  const { parsed, recipe } = resolveRecipe(modelId);
+  const chat = recipe.touchpoints.chat;
+  if (!chat) {
+    throw new AIConfigError(`Provider "${recipe.id}" does not support governed chat execution.`);
+  }
+  if (!chat.supports_tools) {
+    throw new AIConfigError(`Provider "${recipe.id}" cannot run the governed agent tool loop.`);
+  }
+  return { model: `${parsed.providerId}:${parsed.modelId}`, parsed, recipe };
+}
+
+/** Parse the durable operator-owned governed-model allowlist. */
+export function parseGovernedModelList(value: string | null | undefined): string[] {
+  if (value === null || value === undefined || value === '') return [];
+  const entries = value.split(',').map(model => model.trim());
+  if (entries.length > 100 || entries.some(model => model === '')) {
+    throw new AIConfigError('agent.approved_models must contain 1-100 comma-separated provider:model identifiers.');
+  }
+  return [...new Set(entries.map(model => normalizeGovernedModel(model).model))].sort();
+}
+
+/** One model-eligibility definition for governed OAuth registration and submit_agent. */
+export function evaluateGovernedModelPolicy(
+  modelId: string,
+  operatorModels: ReadonlyArray<string | null | undefined>,
+): GovernedModelPolicy {
+  const normalized = normalizeGovernedModel(modelId);
+  const staticCatalog = (normalized.recipe.touchpoints.chat?.models ?? []).includes(normalized.parsed.modelId);
+  const operatorApproved = isModelExplicitlyConfigured(normalized.model, operatorModels);
+  if (!staticCatalog && !operatorApproved) {
+    throw new AIConfigError(
+      `Model "${normalized.model}" is not in the provider's static chat catalog or operator approval.`,
+    );
+  }
+  return { ...normalized, staticCatalog, operatorApproved };
+}
+
 type KnownTouchpointKey = 'embedding' | 'expansion' | 'chat' | 'reranker';
 
 function getTouchpoint(recipe: Recipe, touchpoint: TouchpointKind): EmbeddingTouchpoint | ExpansionTouchpoint | ChatTouchpoint | RerankerTouchpoint | undefined {

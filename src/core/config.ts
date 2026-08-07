@@ -970,6 +970,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.use_gateway_loop',
   // Optional comma-separated operator allowlist for governed agent providers.
   'agent.enabled_providers',
+  // Durable operator approval for governed dynamic provider:model ids.
+  'agent.approved_models',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
   // DB-plane (v0.32.3 search modes + related)

@@ -3452,51 +3452,56 @@ const submit_agent: Operation = {
     // Governed callers choose one exact provider:model. Resolve aliases once,
     // persist the requested/effective pair, and never consult a fallback chain.
     const requestedModel = typeof p.model === 'string' ? p.model : '';
-    if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/.test(requestedModel)) {
-      throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
-    }
-    const { resolveRecipe, assertTouchpoint, isModelExplicitlyConfigured } = await import('./ai/model-resolver.ts');
-    let recipe: import('./ai/types.ts').Recipe;
-    let parsed: import('./ai/types.ts').ParsedModelId;
+    const {
+      evaluateGovernedModelPolicy,
+      normalizeGovernedModel,
+      parseGovernedModelList,
+    } = await import('./ai/model-resolver.ts');
+    let normalized: ReturnType<typeof normalizeGovernedModel>;
     try {
-      ({ recipe, parsed } = resolveRecipe(requestedModel));
+      normalized = normalizeGovernedModel(requestedModel);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('bounded provider:model')) {
+        throw new OperationError('invalid_model', 'submit_agent.model must be a bounded provider:model identifier.');
+      }
+      if (message.includes('Unknown provider')) {
+        throw new OperationError('unknown_provider', `submit_agent refused provider for "${requestedModel}": ${message}`);
+      }
+      if (message.includes('tool loop')) {
+        throw new OperationError('model_not_tool_capable', message);
+      }
       throw new OperationError(
-        'unknown_provider',
-        `submit_agent refused provider for "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
+        'unknown_model',
+        `submit_agent refused model "${requestedModel}": ${message}`,
       );
     }
+    const dbChatModel = ctx.config.chat_model === undefined
+      ? await ctx.engine.getConfig('chat_model').catch(() => null)
+      : null;
+    const approvedModelsRaw = await ctx.engine.getConfig('agent.approved_models').catch(() => null);
+    let policy: ReturnType<typeof evaluateGovernedModelPolicy>;
     try {
-      assertTouchpoint(recipe, 'chat', parsed.modelId);
+      policy = evaluateGovernedModelPolicy(normalized.model, [
+        ctx.config.chat_model ?? dbChatModel,
+        ...(ctx.config.chat_fallback_chain ?? []),
+        ...parseGovernedModelList(approvedModelsRaw),
+      ]);
     } catch (error) {
       throw new OperationError(
         'unknown_model',
         `submit_agent refused model "${requestedModel}": ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const effectiveModel = `${parsed.providerId}:${parsed.modelId}`;
+    const { recipe, parsed } = policy;
+    const effectiveModel = policy.model;
     if (!allowedProviders.includes(parsed.providerId)) {
       throw new OperationError('provider_not_allowed', `Provider "${parsed.providerId}" is not allowed for this OAuth client.`);
     }
     if (!allowedModels.includes(effectiveModel)) {
       throw new OperationError('model_not_allowed', `Model "${effectiveModel}" is not allowed for this OAuth client.`);
     }
-    const chat = recipe.touchpoints.chat;
-    if (!chat?.supports_tools) {
-      throw new OperationError('model_not_tool_capable', `Model "${effectiveModel}" cannot run the agent tool loop.`);
-    }
-    const dbChatModel = ctx.config.chat_model === undefined
-      ? await ctx.engine.getConfig('chat_model').catch(() => null)
-      : null;
-    const configuredModels = [ctx.config.chat_model ?? dbChatModel, ...(ctx.config.chat_fallback_chain ?? [])]
-      .filter((model): model is string => typeof model === 'string');
-    const explicitlyConfigured = isModelExplicitlyConfigured(effectiveModel, configuredModels);
-    if (!(chat.models ?? []).includes(parsed.modelId) && !explicitlyConfigured) {
-      throw new OperationError(
-        'unknown_model',
-        `Model "${effectiveModel}" is not in the provider's static chat catalog or explicit operator configuration.`,
-      );
-    }
+    const explicitlyConfigured = policy.operatorApproved;
     const enabledProvidersRaw = await ctx.engine.getConfig('agent.enabled_providers').catch(() => null);
     if (enabledProvidersRaw !== null) {
       const enabledProviders = enabledProvidersRaw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean);

@@ -204,6 +204,41 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(Number(jobs[0].count)).toBe(0);
     });
 
+    it('uses operator-approved dynamic model policy consistently with registration', async () => {
+      const model = 'openai:gpt-5'; // canonically priced, intentionally absent from the static recipe catalog
+      await seedClient('dynamic-policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['openai'], allowed_models: [model],
+      });
+
+      await expect(callSubmitAgent(makeCtx({
+        clientId: 'dynamic-policy', dryRun: true, config: { openai_api_key: 'test-key' },
+      }), { prompt: 'go', model })).rejects.toMatchObject({ code: 'unknown_model' });
+
+      await engine.setConfig('agent.approved_models', model);
+      const result = await callSubmitAgent(makeCtx({
+        clientId: 'dynamic-policy', dryRun: true, config: { openai_api_key: 'test-key' },
+      }), { prompt: 'go', model });
+      expect(result.effective_model).toBe(model);
+
+      await engine.unsetConfig('agent.approved_models');
+      await expect(callSubmitAgent(makeCtx({
+        clientId: 'dynamic-policy', dryRun: true, config: { openai_api_key: 'test-key' },
+      }), { prompt: 'go', model })).rejects.toMatchObject({ code: 'unknown_model' });
+    });
+
+    it('keeps pricing fail-closed for an operator-approved remote future model', async () => {
+      const model = 'openai:gbrain-test-future-model';
+      await engine.setConfig('agent.approved_models', model);
+      await seedClient('dynamic-unpriced', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['openai'], allowed_models: [model],
+      });
+      await expect(callSubmitAgent(makeCtx({
+        clientId: 'dynamic-unpriced', config: { openai_api_key: 'test-key' },
+      }), { prompt: 'go', model })).rejects.toMatchObject({ code: 'pricing_unavailable' });
+    });
+
     it('admits an explicitly configured zero-cost Ollama model only', async () => {
       const model = 'ollama:gemma4:e2b';
       await seedClient('local-policy', {
@@ -224,6 +259,17 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
 
       const jobs = await engine.executeRaw<{ count: number }>(`SELECT COUNT(*)::int AS count FROM minion_jobs`);
       expect(Number(jobs[0].count)).toBe(1);
+
+      const dynamicModel = 'ollama:gbrain-test-local-model';
+      await seedClient('dynamic-local-policy', {
+        bound_tools: ['search'], bound_slug_prefixes: ['wiki/'],
+        allowed_providers: ['ollama'], allowed_models: [dynamicModel],
+      });
+      await engine.setConfig('agent.approved_models', dynamicModel);
+      const dynamicResult = await callSubmitAgent(makeCtx({ clientId: 'dynamic-local-policy', config: {} }), {
+        prompt: 'go', model: dynamicModel,
+      });
+      expect(dynamicResult.effective_model).toBe(dynamicModel);
     });
 
     it('preserves requested id and records the canonical effective alias without fallback', async () => {
