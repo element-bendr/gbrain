@@ -1,7 +1,12 @@
 import type { SqlQuery } from './sql-query.ts';
+import type { GBrainConfig } from './config.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { BRAIN_TOOL_ALLOWLIST } from './minions/tools/brain-allowlist.ts';
-import { assertTouchpoint, knownProviderIds, resolveRecipe } from './ai/model-resolver.ts';
+import {
+  evaluateGovernedModelPolicy,
+  knownProviderIds,
+  parseGovernedModelList,
+} from './ai/model-resolver.ts';
 
 export const AGENT_CONTROL_CAPABILITIES = [
   'whoami',
@@ -52,22 +57,16 @@ function normalizeBudget(value: string | number | undefined): string | null {
   return parsed.toString();
 }
 
-function normalizeModel(value: string): string {
-  if (!/^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/.test(value)) {
-    throw new Error(`allowed model "${value}" must use a bounded provider:model identifier`);
-  }
-  const { parsed, recipe } = resolveRecipe(value);
-  assertTouchpoint(recipe, 'chat', parsed.modelId);
-  if (!(recipe.touchpoints.chat?.models ?? []).includes(parsed.modelId)) {
-    throw new Error(`unknown static chat model: ${parsed.providerId}:${parsed.modelId}`);
-  }
-  return `${parsed.providerId}:${parsed.modelId}`;
+async function readConfig(sql: SqlQuery, key: string): Promise<string | null> {
+  const rows = await sql`SELECT value FROM config WHERE key = ${key} LIMIT 1`;
+  return typeof rows[0]?.value === 'string' ? rows[0].value : null;
 }
 
 export async function validateAgentClientBindings(
   sql: SqlQuery,
   input: AgentClientBindings,
   defaultSourceId = 'default',
+  operatorConfig?: Pick<GBrainConfig, 'chat_model' | 'chat_fallback_chain'>,
 ): Promise<NormalizedAgentClientBindings> {
   const governed = input.controlCapabilities !== undefined ||
     input.allowedProviders !== undefined || input.allowedModels !== undefined;
@@ -124,7 +123,22 @@ export async function validateAgentClientBindings(
     if (!knownProviders.has(provider)) throw new Error(`unknown provider: ${provider}`);
   }
 
-  const allowedModels = uniqueSorted(input.allowedModels).map(normalizeModel).sort();
+  const requestedModels = uniqueSorted(input.allowedModels);
+  let allowedModels: string[] = [];
+  if (requestedModels.length > 0) {
+    const dbChatModel = operatorConfig?.chat_model === undefined
+      ? await readConfig(sql, 'chat_model')
+      : null;
+    const approvedModels = parseGovernedModelList(await readConfig(sql, 'agent.approved_models'));
+    const operatorModels = [
+      operatorConfig?.chat_model ?? dbChatModel,
+      ...(operatorConfig?.chat_fallback_chain ?? []),
+      ...approvedModels,
+    ];
+    allowedModels = requestedModels
+      .map(model => evaluateGovernedModelPolicy(model, operatorModels).model)
+      .sort();
+  }
   for (const model of allowedModels) {
     const provider = model.slice(0, model.indexOf(':'));
     if (allowedProviders.length > 0 && !allowedProviders.includes(provider)) {

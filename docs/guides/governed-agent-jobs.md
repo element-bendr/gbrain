@@ -1,20 +1,19 @@
 # Governed OAuth Agent Jobs
 
-This is the operator runbook for the governed agent-job branch. It covers the
+This is the operator runbook for governed agent jobs. It covers the
 PostgreSQL-only `submit_agent` path, not local `gbrain agent run` and not the
 general Minions deployment described in [minions-deployment.md](minions-deployment.md).
 
 Verified on 2026-08-07:
 
-- branch: `agent/gbrain-governed-multimodel-job-control`
 - fork: `https://github.com/element-bendr/gbrain`
-- branch version: `0.42.73.2`
+- merged commit: `bae5c064eac45e3ce1cc9ba04dd83ba2650c7b66`
+- fork branch: `master`
 - prior installed version: `0.42.53.0` from `garrytan/gbrain#814258d`
 - live gate: PostgreSQL + OAuth HTTP MCP + `ollama:gemma4:e2b`
 
-The branch is intentionally unmerged. Installation and rollback below operate
-on the global Bun package only; they do not merge Git branches or configure an
-agent client.
+PR #1 is merged into the fork's `master`. Installation and rollback below
+operate on the global Bun package only; they do not configure an agent client.
 
 ## Architecture and authority
 
@@ -44,7 +43,7 @@ The authenticated OAuth client ID is the owner. Request fields such as
 Admission is atomic: concurrency, idempotency, and daily budget are checked in
 the same PostgreSQL transaction that creates the job.
 
-## Install the branch without merging
+## Install the fork build
 
 Record the current version and rollback source before changing the global
 package:
@@ -56,22 +55,22 @@ rg -n '"gbrain".*github:' ~/.bun/install/global/bun.lock
 
 For the verified host, the rollback source is
 `github:garrytan/gbrain#814258d` (`gbrain 0.42.53.0`). Install the governed
-branch:
+fork master:
 
 ```bash
-GBRAIN_BRANCH_SPEC='github:element-bendr/gbrain#agent/gbrain-governed-multimodel-job-control'
+GBRAIN_BRANCH_SPEC='github:element-bendr/gbrain#master'
 
 bun remove --global gbrain
 bun add --global "$GBRAIN_BRANCH_SPEC"
 gbrain --version
 ```
 
-Expected version: `gbrain 0.42.73.2`. Confirm that the installed Git resolution
-matches the current fork branch before starting services:
+Expected version: `gbrain 0.42.73.3`. Confirm that the installed Git resolution
+matches the current fork master before starting services:
 
 ```bash
 git ls-remote https://github.com/element-bendr/gbrain.git \
-  refs/heads/agent/gbrain-governed-multimodel-job-control
+  refs/heads/master
 rg -n '"gbrain".*element-bendr/gbrain' ~/.bun/install/global/bun.lock
 ```
 
@@ -81,13 +80,49 @@ ownership, and spend invariants require PostgreSQL.
 ## Configure provider and pricing policy
 
 Every submission must name one explicit `provider:model`. No fallback model is
-used for governed jobs. The model must satisfy all of these gates:
+used for governed jobs. Authority narrows in one direction:
+
+```text
+GBrain operator policy
+        ↓
+OAuth client allowed_providers / allowed_models
+        ↓
+per-job requested model
+```
+
+Each level may narrow the level above it; none may widen it. Static recipe
+models are eligible by default. A model absent from the static catalog is
+eligible only when the operator has configured it through `chat_model`, the
+effective `chat_fallback_chain`, or the dedicated durable allowlist:
+
+```bash
+gbrain config set agent.approved_models \
+  'openai:gbrain-test-future-model,anthropic:another-reviewed-model'
+```
+
+Use `agent.approved_models` when approving several governed models. Do not add
+models to `chat_fallback_chain` merely to authorize them: that setting also
+changes ordinary chat fallback behavior. Values are validated as bounded,
+known-provider, tool-capable `provider:model` identifiers and stored in a
+canonical sorted form.
+
+The model must satisfy all of these gates:
 
 1. the provider recipe supports chat, tools, and subagents;
 2. the operator explicitly configured the model or it is in the static catalog;
 3. the provider is enabled globally;
 4. the OAuth client allows the exact provider and normalized model;
-5. canonical pricing exists.
+5. required provider credentials and canonical pricing exist before execution.
+
+`supports_tools` alone is insufficient when a provider declares
+`supports_subagent_loop: false`; governed registration and submission reject
+that provider before execution.
+
+Registration establishes eligibility and may happen before credentials or
+pricing are installed. `submit_agent` independently checks current provider
+enablement, credentials, and pricing before queueing paid work. The worker
+rechecks pricing before each provider call. Registration never proves remote
+availability; provider rejection remains a runtime result.
 
 Unknown or unapproved pricing fails before queueing. The only approved zero-cost
 exception is an explicitly configured local Ollama model. The verified local
@@ -104,6 +139,12 @@ gbrain config get agent.enabled_providers
 Remote providers retain their normal credential requirements and must have
 non-zero canonical pricing. Never use a zero price to bypass an unknown remote
 rate.
+
+Removing a dynamic model from `agent.approved_models` blocks new registrations
+and new submissions immediately. Already queued paid jobs retain their exact
+audited admission model; they do not silently fall back. Existing execution
+readiness checks still apply, and the local zero-cost exception rechecks current
+operator configuration before execution.
 
 ## Start HTTP MCP and the worker
 

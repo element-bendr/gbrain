@@ -50,7 +50,11 @@ import {
 import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop, withGatewaySpendContext } from '../../ai/gateway.ts';
+import {
+  registerConfigSelectedChatModel,
+  toolLoop as gatewayToolLoop,
+  withGatewaySpendContext,
+} from '../../ai/gateway.ts';
 import type {
   ChatToolDef,
   ChatMessage,
@@ -60,7 +64,11 @@ import type {
   GatewaySpendContext,
 } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
-import { isModelExplicitlyConfigured, resolveRecipe } from '../../ai/model-resolver.ts';
+import {
+  isModelExplicitlyConfigured,
+  parseGovernedModelList,
+  resolveRecipe,
+} from '../../ai/model-resolver.ts';
 import { randomUUIDv7 } from 'bun';
 
 // ── Defaults ────────────────────────────────────────────────
@@ -877,10 +885,17 @@ async function loadGovernedGatewaySpendContext(
   const dbChatModel = config.chat_model === undefined
     ? await engine.getConfig('chat_model').catch(() => null)
     : null;
-  const configuredModels = [config.chat_model ?? dbChatModel, ...(config.chat_fallback_chain ?? [])];
   const providerId = (() => {
     try { return resolveRecipe(model).parsed.providerId; } catch { return null; }
   })();
+  const approvedModels = providerId === 'ollama'
+    ? parseGovernedModelList(await engine.getConfig('agent.approved_models').catch(() => null))
+    : [];
+  const configuredModels = [
+    config.chat_model ?? dbChatModel,
+    ...(config.chat_fallback_chain ?? []),
+    ...approvedModels,
+  ];
   return {
     engine,
     clientId: ownerClientId,
@@ -910,6 +925,11 @@ async function loadGovernedGatewaySpendContext(
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
   const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, spendContext } = args;
+
+  // Governed jobs were policy-checked before queue insertion. Preserve that
+  // immutable admission decision for already-queued work while still letting
+  // gateway's native-provider boundary accept the exact audited model id.
+  if (spendContext) registerConfigSelectedChatModel(model);
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.

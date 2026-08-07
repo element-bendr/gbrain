@@ -129,6 +129,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
+    let persistedValue = value;
     // v0.37.11.0 fix wave (Lane C.2 + CDX2-13): refuse writes to schema-sizing
     // fields unconditionally. These fields size the `content_chunks.embedding`
     // column at init time and are file-plane canonical. `gbrain config set
@@ -214,6 +215,16 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
           `[config]   gbrain config set spend.posture tokenmax   # cost gates become informational\n` +
           `[config]   gbrain config set spend.posture gated       # default — gates enforce`,
         );
+        process.exit(1);
+      }
+    }
+
+    if (key === 'agent.approved_models') {
+      const { parseGovernedModelList } = await import('../core/ai/model-resolver.ts');
+      try {
+        persistedValue = parseGovernedModelList(value).join(',');
+      } catch (err) {
+        console.error(`[config] agent.approved_models rejected: ${(err as Error).message}`);
         process.exit(1);
       }
     }
@@ -329,11 +340,11 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
     }
 
-    await engine.setConfig(key, value);
+    await engine.setConfig(key, persistedValue);
     // v0.36.x #892: redact sensitive values in confirmation output. API
     // keys / tokens / passwords are commonly set from terminals with
     // scrollback; echoing the raw value to stderr leaks the secret.
-    console.log(`Set ${key} = ${redactConfigValue(key, value)}`);
+    console.log(`Set ${key} = ${redactConfigValue(key, persistedValue)}`);
 
     // v0.40.3.0 (D3 + Phase 2B): mode-switch UX. Fires only on
     // search.mode writes. Honors GBRAIN_NO_MODE_SWITCH_UX=1 + non-TTY.

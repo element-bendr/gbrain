@@ -32,6 +32,7 @@ import {
   validateAgentClientBindings,
   type AgentClientBindings,
 } from './agent-client-bindings.ts';
+import type { GBrainConfig } from './config.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -208,6 +209,7 @@ export function coerceTimestamp(value: unknown): number | undefined {
 
 interface GBrainOAuthProviderOptions {
   sql: SqlQuery;
+  operatorConfig?: () => Pick<GBrainConfig, 'chat_model' | 'chat_fallback_chain'> | undefined;
   /** Default token TTL in seconds (default: 3600 = 1 hour) */
   tokenTtl?: number;
   /** Default refresh token TTL in seconds (default: 30 days) */
@@ -412,6 +414,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   private sql: SqlQuery;
   private _clientsStore: GBrainClientsStore;
   private readonly dcrDisabled: boolean;
+  private readonly operatorConfig?: () => Pick<GBrainConfig, 'chat_model' | 'chat_fallback_chain'> | undefined;
   private tokenTtl: number;
   private refreshTtl: number;
 
@@ -419,6 +422,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     this.sql = options.sql;
     this._clientsStore = new GBrainClientsStore(this.sql, options.allowClientCredentialsDcr === true);
     this.dcrDisabled = options.dcrDisabled === true;
+    this.operatorConfig = options.operatorConfig;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
   }
@@ -988,7 +992,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     assertAllowedScopes(parseScopeString(scopes));
 
     const bindings = agentBindings
-      ? await validateAgentClientBindings(this.sql, agentBindings, sourceId)
+      ? await validateAgentClientBindings(this.sql, agentBindings, sourceId, this.operatorConfig?.())
       : null;
     const governedBindings = agentBindings && (
       agentBindings.controlCapabilities !== undefined ||

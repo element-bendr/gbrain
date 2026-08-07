@@ -494,7 +494,7 @@ async function registerClient(name: string, args: string[]) {
   try {
     await withConfiguredSql(async (sql) => {
       const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
-      const provider = new GBrainOAuthProvider({ sql });
+      const provider = new GBrainOAuthProvider({ sql, operatorConfig: () => loadConfig() ?? undefined });
       const { clientId, clientSecret } = await provider.registerClientManual(
         name, grantTypes, scopes, redirectUris, sourceId, federatedRead, tokenEndpointAuthMethod, agentBindings,
       );

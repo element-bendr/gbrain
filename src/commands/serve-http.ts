@@ -726,6 +726,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // is not passed); cleaner shape for tests and future maintainers.
   const oauthProvider = new GBrainOAuthProvider({
     sql,
+    operatorConfig: () => loadConfig() ?? undefined,
     tokenTtl,
     dcrDisabled: !enableDcr,
     allowClientCredentialsDcr: enableDcrInsecure === true,

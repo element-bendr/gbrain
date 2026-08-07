@@ -2,6 +2,31 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.73.3] - 2026-08-07
+
+**Governed OAuth clients can now use a future chat model without waiting for a
+GBrain recipe update, but only after the GBrain operator approves that exact
+`provider:model`.** Static recipe models remain eligible by default. Dynamic
+models may be approved through the effective chat configuration or the new
+durable `agent.approved_models` setting; OAuth client bindings and individual
+jobs can only narrow that operator policy.
+
+Registration and `submit_agent` now share one model-eligibility check. Unknown
+providers, malformed IDs, providers without the governed tool loop, disabled
+providers, missing credentials, and unknown paid pricing remain fail-closed.
+Dynamic Client Registration cannot write governed bindings, and no silent model
+fallback was added.
+
+### To take advantage of v0.42.73.3
+
+Approve any non-catalog models before registering or using them:
+
+```bash
+gbrain config set agent.approved_models 'openai:reviewed-future-model'
+```
+
+Existing static-catalog clients need no changes.
+
 ## [0.42.73.2] - 2026-08-05
 
 **A write that deduplication redirects onto an existing page is now checked against the write scope of whoever asked for it.** When the same content arrives under a new slug, gbrain recognises it and points the write at the page that already holds it. That redirected target is now tested against the caller's own scope — under whichever mechanism confines that caller. One of the two mechanisms was consulted at that point; both are now.
